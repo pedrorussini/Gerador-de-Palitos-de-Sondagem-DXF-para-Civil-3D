@@ -121,18 +121,11 @@ def _hatch_raw(x1, y1, x2, y2, layer: str) -> str:
         f" 98\n     0\n"       # number of seed points
     )
 
-# Lista global de hachuras raw a injetar no DXF
-_raw_hatches: list = []
-
-def _add_solid_hatch(msp, pts: list, layer: str):
-    """
-    Registra uma hachura SOLID para injeção posterior no DXF raw.
-    pts deve ter 4 pontos: [topo-esq, topo-dir, base-dir, base-esq]
-    """
-    # Calcular bounding box dos pontos
+def _add_solid_hatch(hatches: list, pts: list, layer: str):
+    """Registra hachura SOLID na lista fornecida."""
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
-    _raw_hatches.append((min(xs), min(ys), max(xs), max(ys), layer))
+    hatches.append((min(xs), min(ys), max(xs), max(ys), layer))
 
 
 
@@ -155,8 +148,8 @@ def _setup_layers(doc):
             l.dxf.lineweight = lw
 
 
-def _exportar(doc) -> bytes:
-    """Exporta DXF e injeta hachuras SOLID raw antes do ENDSEC final."""
+def _exportar(doc, hatches: list = None) -> bytes:
+    """Exporta DXF e injeta hachuras SOLID raw antes do ENDSEC da seção ENTITIES."""
     import tempfile, os
 
     buf = io.BytesIO()
@@ -173,29 +166,54 @@ def _exportar(doc) -> bytes:
         os.unlink(tmp_path)
 
     # Injetar hachuras SOLID como texto DXF raw
-    if _raw_hatches:
+    if hatches:
         try:
             texto = data.decode("latin-1")
+            nl = "\n"
+
+            # Construir bloco de hachuras
             hatches_str = ""
-            for x1, y1, x2, y2, layer in _raw_hatches:
+            for x1, y1, x2, y2, layer in hatches:
                 hatches_str += _hatch_raw(x1, y1, x2, y2, layer)
-            # Inserir antes do último ENDSEC (fim da seção ENTITIES)
-            marker = "  0\nENDSEC"
-            idx = texto.rfind(marker)
-            if idx >= 0:
-                texto = texto[:idx] + hatches_str + texto[idx:]
+
+            # Encontrar o ENDSEC da seção ENTITIES
+            # Estrutura: "  2\nENTITIES\n...\n  0\nENDSEC\n"
+            # Encontrar início da seção ENTITIES
+            idx_entities = texto.find("SECTION" + nl + "  2" + nl + "ENTITIES")
+            if idx_entities < 0:
+                # Tentar variante com espaços diferentes
+                idx_entities = texto.find("ENTITIES")
+
+            if idx_entities >= 0:
+                # Encontrar o próximo ENDSEC após ENTITIES
+                idx_endsec = texto.find("ENDSEC", idx_entities)
+                # Recuar para incluir o "  0\n" antes de ENDSEC
+                idx_insert = texto.rfind("  0" + nl + "ENDSEC", idx_entities, idx_endsec + 10)
+                if idx_insert >= 0:
+                    texto = texto[:idx_insert] + hatches_str + texto[idx_insert:]
+                else:
+                    # Fallback: inserir antes do ENDSEC encontrado
+                    idx_insert = idx_endsec - 5
+                    # Encontrar início da linha do ENDSEC
+                    linha_ini = texto.rfind(nl, 0, idx_endsec) + 1
+                    # Recuar mais uma linha (o "  0")
+                    linha_ini2 = texto.rfind(nl, 0, linha_ini - 1) + 1
+                    texto = texto[:linha_ini2] + hatches_str + texto[linha_ini2:]
+
             data = texto.encode("latin-1", errors="replace")
-        except Exception:
+        except Exception as e:
             pass
-        _raw_hatches.clear()
+
 
     return data
 
 
-def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
+def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0, hatches: list = None):
     """Desenha um palito completo deslocado por ox."""
     from ezdxf.enums import TextEntityAlignment as TA
 
+    if hatches is None:
+        hatches = []
     metros   = sond.metros
     prof_max = sond.profundidade_total
     y_topo   = _y(0.0)
@@ -299,7 +317,7 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
             if m % 2 == 1:  # metros ímpares
                 y_topo_m = _y(float(m - 1))
                 y_base_m = _y(float(m))
-                _add_solid_hatch(msp, [
+                _add_solid_hatch(hatches, [
                     (X(PAL_X - 5.0), y_topo_m),
                     (X(PAL_X + 5.0), y_topo_m),
                     (X(PAL_X + 5.0), y_base_m),
@@ -375,8 +393,9 @@ def gerar_dxf_sondagem(
     doc = ezdxf.new("R2010")
     doc.units = 6  # metros
     _setup_layers(doc)
-    _palito(doc.modelspace(), sondagem, distancia, incluir_hachura, ox=0.0)
-    return _exportar(doc)
+    hatches = []
+    _palito(doc.modelspace(), sondagem, distancia, incluir_hachura, ox=0.0, hatches=hatches)
+    return _exportar(doc, hatches)
 
 
 def gerar_dxf_multiplas(
@@ -398,7 +417,8 @@ def gerar_dxf_multiplas(
     doc.units = 6
     _setup_layers(doc)
     msp = doc.modelspace()
+    hatches = []
     for i, (sond, dist) in enumerate(zip(sondagens, distancias)):
         if sond.metros:
-            _palito(msp, sond, dist, incluir_hachura, ox=i * espacamento_x)
-    return _exportar(doc)
+            _palito(msp, sond, dist, incluir_hachura, ox=i * espacamento_x, hatches=hatches)
+    return _exportar(doc, hatches)
