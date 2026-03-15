@@ -103,9 +103,21 @@ def _line(x1, y1, x2, y2, layer):
     )
 
 
+def _esc_mtext(text: str) -> str:
+    """Escapa caracteres não-ASCII no texto MTEXT usando notação DXF \\U+XXXX."""
+    out = []
+    for c in text:
+        if ord(c) > 127:
+            out.append(f"\\U+{ord(c):04X}")
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
 def _mtext(text, x, y, height, layer, width=4.0, attach=1):
     n_lines = text.count('^J') + 1
-    box_h   = height * n_lines * 1.5
+    box_h   = round(height * n_lines * 1.5, 6)
+    safe    = _esc_mtext(text)
     return (
         f"  0\nMTEXT\n  5\n{_h()}\n330\n1F\n"
         f"100\nAcDbEntity\n  8\n{layer}\n"
@@ -116,7 +128,7 @@ def _mtext(text, x, y, height, layer, width=4.0, attach=1):
         f" 46\n{box_h}\n"
         f" 71\n{attach:6d}\n"
         f" 72\n     5\n"
-        f"  1\n{text}\n"
+        f"  1\n{safe}\n"
         f"  7\nARIAL\n"
         f" 73\n     1\n"
         f" 44\n1.0\n"
@@ -282,7 +294,7 @@ def _palito(sond, dist, hachura, ox=0.0):
     out.append(_insert("impenetravel", X(PAL_XC), y_fundo, 0.2, "BLC"))
 
     # Rodapé
-    out.append(_mtext(f"Prof.={prof_max:.2f}m".replace(".", ","),
+    out.append(_mtext(f"Prof.={prof_max:.2f}m".replace(",", "X").replace(".", ",").replace("X", "."),
                       X(PROF_X), y_fundo - 0.5, H_PROF, LY_NSPT,
                       width=1.0, attach=5))
 
@@ -293,16 +305,49 @@ def _palito(sond, dist, hachura, ox=0.0):
 # Build DXF
 # ---------------------------------------------------------------------------
 
+_LATIN1_SUBS = str.maketrans({
+    '\u2019': "'", '\u2018': "'", '\u201c': '"', '\u201d': '"',
+    '\u2013': '-', '\u2014': '-', '\u00b0': chr(176),
+})
+
+def _para_latin1(txt: str) -> str:
+    """Converte string Python para latin-1 seguro, preservando acentos."""
+    import unicodedata
+    txt = txt.translate(_LATIN1_SUBS)
+    # Tentar encode direto
+    try:
+        txt.encode('latin-1')
+        return txt
+    except UnicodeEncodeError:
+        pass
+    # Normalizar NFC → decompõe e recompõe caracteres compostos
+    txt = unicodedata.normalize('NFC', txt)
+    # Converter char a char
+    out = []
+    for c in txt:
+        try:
+            c.encode('latin-1')
+            out.append(c)
+        except UnicodeEncodeError:
+            # Tentar NFKD para extrair base ASCII
+            nfkd = unicodedata.normalize('NFKD', c)
+            base = ''.join(ch for ch in nfkd if not unicodedata.combining(ch))
+            out.append(base if base else '?')
+    return ''.join(out)
+
+
 def _build(entidades):
     _H[0] = 0x8000
     before, after = _tmpl()
     dxf_txt = before + entidades + after
 
     # Atualizar $HANDSEED para ser maior que o maior handle gerado
-    # O Civil 3D rejeita DXFs onde handles excedem o $HANDSEED do header
     novo_seed = f"{_H[0] + 0x100:X}"
-    dxf_txt = re.sub(r'(\$HANDSEED\n\s*5\n)([0-9A-Fa-f]+)', 
+    dxf_txt = re.sub(r'(\$HANDSEED\n\s*5\n)([0-9A-Fa-f]+)',
                      r'\g<1>' + novo_seed, dxf_txt, count=1)
+
+    # Converter para CRLF (o modelo original usa CRLF)
+    dxf_txt = dxf_txt.replace('\r\n', '\n').replace('\n', '\r\n')
 
     return dxf_txt.encode('latin-1', errors='replace')
 
