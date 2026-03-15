@@ -1,77 +1,49 @@
 """
-gerar_dxf.py — Gera DXF de palito SPT fiel ao modelo padrão brasileiro.
+gerar_dxf.py — Gera DXF de palito SPT escrevendo o formato diretamente.
 
-Estrutura baseada na análise do arquivo sondagempadrao.dxf:
+Sem dependência de ezdxf — escreve entidades DXF como texto puro.
+Compatível com AutoCAD / Civil 3D (formato R2010 / AC1024).
 
-  Escala: 1 unidade CAD = 1 metro real (escala 1:100 no papel)
-
-  PAL_X = 0.0  → linha vertical do palito (layer furoSondagem)
-  NSPT:  x=+0.2, à DIREITA do palito (layer BR100, h=0.20)
-  DESC:  x=-0.2, à ESQUERDA alinhado à direita (layer BR60, h=0.085)
-         formato: "ORIG - Descrição.: prof_ini-prof_fim"
-  CAB:   MTEXT à direita (x=+0.2), texto "SP-XXX\nALT: X,XXX\nDIST: X,XXX"
-  NA:    texto à direita (x=+2.4, layer Nível D'Água)
-  Linhas de horizonte: horizontais de x=0 até x=-2.4 (layer furoSondagem)
+Estrutura baseada no modelo sondagempadrao.dxf:
+  - Escala: 10 unidades CAD = 1 metro real
+  - Palito: layer furoSondagem, linha vertical em x=0
+  - NSPT:   layer BR100, MTEXT à direita (x=+2), fonte ARIAL h=2.0
+  - Desc:   layer BR60,  MTEXT à esquerda (x=-2), fonte ARIAL h=0.85
+  - Hachura: layer BGEOT-VT, SOLID alternado nos metros ímpares
 """
 
 import io
 
-
 # ---------------------------------------------------------------------------
-# Constantes (unidades CAD — escala 10:1, 10 unidades = 1 metro)
-# Corresponde exatamente ao modelo sondagempadrao.dxf
+# Escala e posições (10 unidades = 1 metro)
 # ---------------------------------------------------------------------------
-_S         = 10.0   # fator de escala: 10 unidades CAD = 1 metro real
+S          = 10.0   # fator de escala
 
-PAL_X      = 0.0    # X da linha do palito
-PAL_Y0     = 0.0    # Y do topo do palito (prof=0)
+PAL_X      = 0.0
+NSPT_X     = 2.0
+DESC_X     = -2.0
+DESC_LARG  = 24.0
+CAB_X      = 2.0
+NA_X       = 24.0
 
-NSPT_X     = 2.0    # NSPT à direita (= 0.2m * 10)
-NSPT_H     = 2.0    # altura texto NSPT (= 0.2m * 10)
+H_NSPT     = 2.0
+H_DESC     = 0.85
+H_CAB      = 1.85
+H_NA       = 2.0
 
-DESC_X     = -2.0   # Descrição à esquerda (= -0.2m * 10)
-DESC_H     = 0.85   # altura texto descrição (= 0.085m * 10)
-DESC_LARG  = 24.0   # comprimento linhas horizonte (= 2.4m * 10)
-
-CAB_X      = 2.0    # Cabeçalho à direita (= 0.2m * 10)
-CAB_H_TXT  = 1.85   # altura texto cabeçalho (= 0.185m * 10)
-
-NA_X       = 24.0   # NA bem à direita (= 2.4m * 10)
-NA_H       = 2.0    # altura texto NA
-
-# Layers (nomes exatos do modelo)
-LY_PALITO  = "furoSondagem"
-LY_NSPT    = "BR100"
-LY_DESC    = "BR60"
-LY_NA      = "Nível D'Água"
-LY_IMPEN   = "Impenetrável"
-LY_GEOT    = "BGEOT-VT"     # hachuras/polígonos de solo
-
-# Hachuras por tipo de solo
-_HACHURAS = {
-    "argila":        ("ANSI31",  45, 0.05),
-    "argiloso":      ("ANSI31",  45, 0.05),
-    "silte":         ("ANSI37",  45, 0.04),
-    "siltoso":       ("ANSI37",  45, 0.04),
-    "areia":         ("AR-SAND",  0, 0.08),
-    "arenoso":       ("AR-SAND",  0, 0.08),
-    "pedregulho":    ("AR-CONC",  0, 0.05),
-    "organico":      ("GRASS",    0, 0.10),
-    "orgânico":      ("GRASS",    0, 0.10),
-    "aterro":        ("ANSI32",   0, 0.08),
-    "rocha":         ("ANSI36",   0, 0.07),
-    "impenetrável":  ("SOLID",    0, 1.00),
-}
+LY_PAL   = "furoSondagem"
+LY_NSPT  = "BR100"
+LY_DESC  = "BR60"
+LY_NA    = "Nível D'Água"
+LY_IMPEN = "Impenetrável"
+LY_HACH  = "BGEOT-VT"
 
 
 def _y(prof: float) -> float:
-    """Converte profundidade (metros) para Y no DXF (10 unidades por metro)."""
-    return PAL_Y0 - prof * _S
-
+    return -(prof * S)
 
 
 def _agrupar(metros: list) -> list:
-    """Agrupa metros consecutivos com mesma descrição em horizontes."""
     if not metros:
         return []
     hs = []
@@ -91,289 +63,240 @@ def _agrupar(metros: list) -> list:
     return hs
 
 
-def _hatch_raw(x1, y1, x2, y2, layer: str) -> str:
-    """
-    Gera string DXF de uma entidade HATCH SOLID para um retângulo.
-    Escrita diretamente no formato DXF para compatibilidade total.
-    """
+# ---------------------------------------------------------------------------
+# Escritores de entidades DXF
+# ---------------------------------------------------------------------------
+
+_handle = [1000]  # contador de handles
+
+def _h():
+    _handle[0] += 1
+    return f"{_handle[0]:X}"
+
+
+def line(x1, y1, x2, y2, layer, lw=25):
     return (
-        f"  0\nHATCH\n"
-        f"  5\nFF\n"          # handle placeholder
-        f"100\nAcDbEntity\n"
-        f"  8\n{layer}\n"
-        f" 62\n     7\n"       # cor branco/preto
-        f"100\nAcDbHatch\n"
-        f" 10\n0.0\n 20\n0.0\n 30\n0.0\n"  # elevation
-        f"210\n0.0\n220\n0.0\n230\n1.0\n"  # normal
-        f"  2\nSOLID\n"        # pattern name
-        f" 70\n     1\n"       # solid fill
-        f" 71\n     0\n"       # associativity
-        f" 91\n     1\n"       # number of boundary paths
-        f" 92\n     1\n"       # boundary type (external)
-        f" 93\n     4\n"       # number of vertices
-        f" 10\n{x1}\n 20\n{y1}\n"
-        f" 10\n{x2}\n 20\n{y1}\n"
-        f" 10\n{x2}\n 20\n{y2}\n"
-        f" 10\n{x1}\n 20\n{y2}\n"
-        f" 97\n     0\n"       # number of source objects
-        f" 75\n     1\n"       # hatch style
-        f" 76\n     1\n"       # hatch pattern type (predefined)
-        f" 98\n     0\n"       # number of seed points
+        f"  0\nLINE\n  5\n{_h()}\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbLine\n"
+        f" 10\n{x1:.4f}\n 20\n{y1:.4f}\n 30\n0.0\n"
+        f" 11\n{x2:.4f}\n 21\n{y2:.4f}\n 31\n0.0\n"
     )
 
-def _add_solid_hatch(hatches: list, pts: list, layer: str):
-    """Registra hachura SOLID na lista fornecida."""
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    hatches.append((min(xs), min(ys), max(xs), max(ys), layer))
+
+def mtext(text, x, y, height, layer, width=0.0, attach=7):
+    """
+    attach: 1=TL 2=TC 3=TR 4=ML 5=MC 6=MR 7=BL 8=BC 9=BR
+    """
+    w = f" 41\n{width:.4f}\n" if width > 0 else ""
+    return (
+        f"  0\nMTEXT\n  5\n{_h()}\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbMText\n"
+        f" 10\n{x:.4f}\n 20\n{y:.4f}\n 30\n0.0\n"
+        f" 40\n{height:.4f}\n"
+        f"{w}"
+        f" 71\n{attach}\n"
+        f"  7\nARIAL\n"
+        f"  1\n{text}\n"
+    )
 
 
-
-def _setup_layers(doc):
-    # Estilo de texto ARIAL (igual ao modelo)
-    if "ARIAL" not in doc.styles:
-        style = doc.styles.add("ARIAL", font="arial.ttf")
-        style.dxf.height = 0.0
-
-    for nome, cor, lw in [
-        (LY_PALITO, 7,  50),   # branco/preto
-        (LY_NSPT,   3,  -3),   # verde
-        (LY_DESC,   3,  -3),   # verde
-        (LY_NA,     5,  25),   # azul
-        (LY_IMPEN,  1,  25),   # vermelho
-        (LY_GEOT,   8,  -3),   # cinza
-    ]:
-        if nome not in doc.layers:
-            l = doc.layers.add(nome, color=cor)
-            l.dxf.lineweight = lw
-
-
-def _exportar(doc, hatches: list = None) -> bytes:
-    """Exporta DXF e injeta hachuras SOLID raw antes do ENDSEC da seção ENTITIES."""
-    import tempfile, os
-
-    buf = io.BytesIO()
-    try:
-        doc.write(buf)
-        buf.seek(0)
-        data = buf.read()
-    except Exception:
-        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-            tmp_path = tmp.name
-        doc.saveas(tmp_path)
-        with open(tmp_path, "rb") as f:
-            data = f.read()
-        os.unlink(tmp_path)
-
-    # Injetar hachuras SOLID como texto DXF raw
-    if hatches:
-        try:
-            texto = data.decode("latin-1")
-            nl = "\n"
-
-            # Construir bloco de hachuras
-            hatches_str = ""
-            for x1, y1, x2, y2, layer in hatches:
-                hatches_str += _hatch_raw(x1, y1, x2, y2, layer)
-
-            # Encontrar o ENDSEC da seção ENTITIES
-            # Estrutura: "  2\nENTITIES\n...\n  0\nENDSEC\n"
-            # Encontrar início da seção ENTITIES
-            idx_entities = texto.find("SECTION" + nl + "  2" + nl + "ENTITIES")
-            if idx_entities < 0:
-                # Tentar variante com espaços diferentes
-                idx_entities = texto.find("ENTITIES")
-
-            if idx_entities >= 0:
-                # Encontrar o próximo ENDSEC após ENTITIES
-                idx_endsec = texto.find("ENDSEC", idx_entities)
-                # Recuar para incluir o "  0\n" antes de ENDSEC
-                idx_insert = texto.rfind("  0" + nl + "ENDSEC", idx_entities, idx_endsec + 10)
-                if idx_insert >= 0:
-                    texto = texto[:idx_insert] + hatches_str + texto[idx_insert:]
-                else:
-                    # Fallback: inserir antes do ENDSEC encontrado
-                    idx_insert = idx_endsec - 5
-                    # Encontrar início da linha do ENDSEC
-                    linha_ini = texto.rfind(nl, 0, idx_endsec) + 1
-                    # Recuar mais uma linha (o "  0")
-                    linha_ini2 = texto.rfind(nl, 0, linha_ini - 1) + 1
-                    texto = texto[:linha_ini2] + hatches_str + texto[linha_ini2:]
-
-            data = texto.encode("latin-1", errors="replace")
-        except Exception as e:
-            pass
+def hatch_solid(x1, y1, x2, y2, layer):
+    """Hachura SOLID para retângulo definido por (x1,y1)-(x2,y2)."""
+    return (
+        f"  0\nHATCH\n  5\n{_h()}\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n 62\n     7\n"
+        f"100\nAcDbHatch\n"
+        f" 10\n0.0\n 20\n0.0\n 30\n0.0\n"
+        f"210\n0.0\n220\n0.0\n230\n1.0\n"
+        f"  2\nSOLID\n"
+        f" 70\n     1\n"   # solid fill
+        f" 71\n     0\n"   # not associative
+        f" 91\n     1\n"   # 1 boundary path
+        f" 92\n     1\n"   # external boundary
+        f" 93\n     4\n"   # 4 vertices
+        f" 10\n{x1:.4f}\n 20\n{y1:.4f}\n"
+        f" 10\n{x2:.4f}\n 20\n{y1:.4f}\n"
+        f" 10\n{x2:.4f}\n 20\n{y2:.4f}\n"
+        f" 10\n{x1:.4f}\n 20\n{y2:.4f}\n"
+        f" 97\n     0\n"   # no source objects
+        f" 75\n     1\n"   # hatch style = normal
+        f" 76\n     1\n"   # predefined pattern
+        f" 47\n0.0\n"      # pixel size
+        f" 98\n     0\n"   # no seed points
+    )
 
 
-    return data
+# ---------------------------------------------------------------------------
+# Cabeçalho DXF
+# ---------------------------------------------------------------------------
+
+def _header():
+    return """\
+  0
+SECTION
+  2
+HEADER
+  9
+$ACADVER
+  1
+AC1015
+  9
+$INSUNITS
+ 70
+6
+  9
+$MEASUREMENT
+ 70
+1
+  0
+ENDSEC
+"""
 
 
-def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0, hatches: list = None):
-    """Desenha um palito completo deslocado por ox."""
-    from ezdxf.enums import TextEntityAlignment as TA
+def _tables():
+    return (
+        "  0\nSECTION\n  2\nTABLES\n"
+        # LAYER table
+        "  0\nTABLE\n  2\nLAYER\n  5\n2\n100\nAcDbSymbolTable\n 70\n    20\n"
+        + _layer_entry(LY_PAL,   7,  0)
+        + _layer_entry(LY_NSPT,  3,  0)   # verde
+        + _layer_entry(LY_DESC,  3,  0)   # verde
+        + _layer_entry(LY_NA,    5,  0)   # azul
+        + _layer_entry(LY_IMPEN, 1,  0)   # vermelho
+        + _layer_entry(LY_HACH,  8,  0)   # cinza
+        + "  0\nENDTAB\n"
+        # STYLE table com ARIAL
+        "  0\nTABLE\n  2\nSTYLE\n  5\n3\n100\nAcDbSymbolTable\n 70\n     2\n"
+        "  0\nSTYLE\n  5\n11\n100\nAcDbSymbolTableRecord\n100\nAcDbTextStyleTableRecord\n"
+        "  2\nStandard\n 70\n     0\n 40\n0.0\n 41\n1.0\n 50\n0.0\n 71\n     0\n"
+        "  3\ntxt\n  4\n\n"
+        "  0\nSTYLE\n  5\n12\n100\nAcDbSymbolTableRecord\n100\nAcDbTextStyleTableRecord\n"
+        "  2\nARIAL\n 70\n     0\n 40\n0.0\n 41\n1.0\n 50\n0.0\n 71\n     0\n"
+        "  3\narial.ttf\n  4\n\n"
+        "  0\nENDTAB\n"
+        "  0\nENDSEC\n"
+    )
 
-    if hatches is None:
-        hatches = []
+
+def _layer_entry(name, color, lw):
+    return (
+        f"  0\nLAYER\n  5\n{_h()}\n"
+        f"100\nAcDbSymbolTableRecord\n"
+        f"100\nAcDbLayerTableRecord\n"
+        f"  2\n{name}\n"
+        f" 70\n     0\n"
+        f" 62\n{color:6d}\n"
+        f"  6\nContinuous\n"
+        f"370\n    25\n"
+    )
+
+
+def _blocks():
+    return (
+        "  0\nSECTION\n  2\nBLOCKS\n"
+        "  0\nBLOCK\n  5\nF0\n100\nAcDbEntity\n  8\n0\n"
+        "100\nAcDbBlockBegin\n  2\n*Model_Space\n 70\n     0\n"
+        " 10\n0.0\n 20\n0.0\n 30\n0.0\n  3\n*Model_Space\n  1\n\n"
+        "  0\nENDBLK\n  5\nF1\n100\nAcDbEntity\n  8\n0\n100\nAcDbBlockEnd\n"
+        "  0\nENDSEC\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Construção do palito
+# ---------------------------------------------------------------------------
+
+def _palito_str(sond, dist: float, hachura: bool, ox: float = 0.0) -> str:
     metros   = sond.metros
     prof_max = sond.profundidade_total
     y_topo   = _y(0.0)
     y_fundo  = _y(prof_max)
+    out      = []
 
     def X(v): return v + ox
 
-    # ----------------------------------------------------------------
-    # CABEÇALHO — MTEXT à direita do palito
-    # Texto multilinha: "SP-XXX\nALT: X,XXX\nDIST: X,XXX"
-    # ----------------------------------------------------------------
-    cab_txt = (f"{sond.nome}\\PALT: {sond.cota_boca:.3f}".replace(".", ",")
-               + f"\\PDIST: {dist:.3f}".replace(".", ","))
+    # Cabeçalho: MTEXT multilinha à direita
+    cab = f"{sond.nome}\\PALT: {sond.cota_boca:.3f}".replace(".", ",")
+    cab += f"\\PDIST: {dist:.3f}".replace(".", ",")
+    out.append(mtext(cab, X(CAB_X), y_topo + S*0.5, H_CAB, LY_NSPT, attach=7))
 
-    msp.add_mtext(
-        cab_txt,
-        dxfattribs={
-            "layer":           LY_NSPT,
-            "char_height":     CAB_H_TXT,
-            "style": "ARIAL", "attachment_point": 7,   # BOTTOM_LEFT
-            "insert":          (X(CAB_X), y_topo + 5.0),
-        }
-    )
+    # Linha vertical do palito
+    out.append(line(X(PAL_X), y_topo, X(PAL_X), y_fundo, LY_PAL, lw=50))
 
-    # ----------------------------------------------------------------
-    # PALITO — linha vertical simples
-    # ----------------------------------------------------------------
-    msp.add_line(
-        (X(PAL_X), y_topo),
-        (X(PAL_X), y_fundo),
-        dxfattribs={"layer": LY_PALITO, "lineweight": 50}
-    )
-
-    # Divisórias a cada metro (traço curto de 0.5m * 10 = 5 unidades)
-    for m in range(1, int(prof_max) + 1):
-        ym = _y(float(m))
-        msp.add_line(
-            (X(PAL_X), ym),
-            (X(PAL_X - 5.0), ym),
-            dxfattribs={"layer": LY_PALITO, "lineweight": 13}
-        )
-
-    # ----------------------------------------------------------------
-    # NSPT — MTEXT à direita do palito, centrado no metro
-    # ----------------------------------------------------------------
+    # Divisórias a cada metro + NSPT
     for m in metros:
+        ym = _y(float(m.prof_m))
+        # Traço curto saindo do palito
+        out.append(line(X(PAL_X), ym, X(PAL_X - 5.0), ym, LY_PAL, lw=13))
+        # NSPT centralizado no metro, à direita
         yc = _y(m.prof_m - 0.5)
-        msp.add_mtext(
-            str(m.nspt),
-            dxfattribs={
-                "layer":           LY_NSPT,
-                "char_height":     NSPT_H,
-                "style": "ARIAL", "attachment_point": 5,  # MIDDLE_CENTER
-                "insert":          (X(NSPT_X), yc),
-            }
-        )
+        out.append(mtext(str(m.nspt), X(NSPT_X), yc, H_NSPT, LY_NSPT, attach=5))
 
-    # ----------------------------------------------------------------
-    # HORIZONTES — descrição à esquerda + linha de horizonte
-    # ----------------------------------------------------------------
-    horizontes = _agrupar(metros)
+    # Horizontes: descrição + linha de limite
+    for h in _agrupar(metros):
+        yi  = _y(h["pi"])
+        yf  = _y(h["pf"])
+        ym  = (yi + yf) / 2.0
 
-    for h in horizontes:
-        yi   = _y(h["pi"])
-        yf   = _y(h["pf"])
-        ym   = (yi + yf) / 2.0
+        # Linha horizontal de limite do horizonte
+        out.append(line(X(PAL_X), yi, X(PAL_X - DESC_LARG), yi, LY_PAL, lw=13))
 
-        # Linha horizontal de limite superior do horizonte
-        msp.add_line(
-            (X(PAL_X), yi),
-            (X(PAL_X - DESC_LARG), yi),
-            dxfattribs={"layer": LY_PALITO, "lineweight": 13}
-        )
+        # Texto: "ORIG - Desc.: pi-pf"
+        pi_s = f"{h['pi']:.2f}".replace(".", ",")
+        pf_s = f"{h['pf']:.2f}".replace(".", ",")
+        txt  = (f"{h['orig']} - {h['desc']}.: {pi_s}-{pf_s}"
+                if h["orig"] else f"{h['desc']}.: {pi_s}-{pf_s}")
+        # Quebrar linhas longas com \P (MTEXT newline)
+        out.append(mtext(txt, X(DESC_X), ym, H_DESC, LY_DESC,
+                         width=DESC_LARG, attach=6))
 
-        # Descrição: "ORIG - Descrição.: prof_ini-prof_fim"
-        pi_str = f"{h['pi']:.2f}".replace(".", ",")
-        pf_str = f"{h['pf']:.2f}".replace(".", ",")
-        if h["orig"]:
-            desc_txt = f"{h['orig']} - {h['desc']}.: {pi_str}-{pf_str}"
-        else:
-            desc_txt = f"{h['desc']}.: {pi_str}-{pf_str}"
-
-        msp.add_mtext(
-            desc_txt,
-            dxfattribs={
-                "layer":           LY_DESC,
-                "char_height":     DESC_H,
-                "style": "ARIAL", "attachment_point": 6,   # MIDDLE_RIGHT
-                "insert":          (X(DESC_X), ym),
-                "width":           DESC_LARG,
-            }
-        )
-
-    # ----------------------------------------------------------------
-    # HACHURA SOLID — metros ímpares (1,3,5,7,9...) dentro do palito
-    # Padrão alternado: metro ímpar = preenchido, metro par = vazio
-    # Largura do palito: x=-0.5 a x=+0.5 (1 unidade = 0.1m real)
-    # ----------------------------------------------------------------
+    # Hachura SOLID alternada — metros ímpares
     if hachura:
         for m in range(1, int(prof_max) + 1):
-            if m % 2 == 1:  # metros ímpares
-                y_topo_m = _y(float(m - 1))
-                y_base_m = _y(float(m))
-                _add_solid_hatch(hatches, [
-                    (X(PAL_X - 5.0), y_topo_m),
-                    (X(PAL_X + 5.0), y_topo_m),
-                    (X(PAL_X + 5.0), y_base_m),
-                    (X(PAL_X - 5.0), y_base_m),
-                ], LY_GEOT)
+            if m % 2 == 1:
+                yt = _y(float(m - 1))
+                yb = _y(float(m))
+                out.append(hatch_solid(X(PAL_X - 5.0), yb,
+                                       X(PAL_X + 5.0), yt, LY_HACH))
 
-    # ----------------------------------------------------------------
-    # NÍVEL D'ÁGUA
-    # ----------------------------------------------------------------
+    # NA
     if sond.nivel_dagua and sond.nivel_dagua > 0:
         yna    = _y(sond.nivel_dagua)
         na_str = f"NA:{sond.nivel_dagua:.2f}".replace(".", ",")
-        # Linha indicativa
-        msp.add_line(
-            (X(PAL_X), yna),
-            (X(PAL_X + 3.0), yna),
-            dxfattribs={"layer": LY_NA, "lineweight": 25}
-        )
-        msp.add_mtext(
-            na_str,
-            dxfattribs={
-                "layer":           LY_NA,
-                "char_height":     NA_H,
-                "style": "ARIAL", "attachment_point": 4,   # MIDDLE_LEFT
-                "insert":          (X(NA_X), yna),
-            }
-        )
+        out.append(line(X(PAL_X), yna, X(PAL_X + 3.0), yna, LY_NA, lw=25))
+        out.append(mtext(na_str, X(NA_X), yna, H_NA, LY_NA, attach=4))
 
-    # ----------------------------------------------------------------
-    # LIMITE DE SONDAGEM
-    # ----------------------------------------------------------------
-    # Linha final + rodapé
-    msp.add_line(
-        (X(PAL_X), y_fundo),
-        (X(PAL_X - DESC_LARG), y_fundo),
-        dxfattribs={"layer": LY_IMPEN, "lineweight": 50}
-    )
-    # Linhas tracejadas de impenetrável
-    for dx in [3.0, 6.0, 9.0, 12.0]:
-        msp.add_line(
-            (X(PAL_X - dx + 1.0), y_fundo),
-            (X(PAL_X - dx - 1.0), y_fundo - 1.5),
-            dxfattribs={"layer": LY_IMPEN, "lineweight": 25}
-        )
+    # Limite de sondagem
+    out.append(line(X(PAL_X), y_fundo, X(PAL_X - DESC_LARG), y_fundo, LY_IMPEN, lw=50))
+    for dx in [3.0, 6.0, 9.0, 12.0, 15.0]:
+        out.append(line(X(PAL_X - dx + 1.0), y_fundo,
+                        X(PAL_X - dx - 1.0), y_fundo - 1.5, LY_IMPEN, lw=25))
 
-    # Texto rodapé
+    # Rodapé
     prof_str = f"Prof.={prof_max:.2f}m".replace(".", ",")
-    msp.add_mtext(
-        prof_str,
-        dxfattribs={
-            "layer":           LY_NSPT,
-            "char_height":     CAB_H_TXT,
-            "style": "ARIAL", "attachment_point": 5,   # MIDDLE_CENTER
-            "insert":          (X(CAB_X + 4.0), y_fundo - 5.0),
-        }
+    out.append(mtext(prof_str, X(CAB_X + 4.0), y_fundo - S*0.5, H_CAB, LY_NSPT, attach=5))
+
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Montar DXF completo
+# ---------------------------------------------------------------------------
+
+def _build_dxf(entidades: str) -> bytes:
+    _handle[0] = 100  # reset handle
+    dxf = (
+        _header()
+        + _tables()
+        + _blocks()
+        + "  0\nSECTION\n  2\nENTITIES\n"
+        + entidades
+        + "  0\nENDSEC\n"
+        + "  0\nEOF\n"
     )
+    return dxf.encode("latin-1", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -386,16 +309,9 @@ def gerar_dxf_sondagem(
     incluir_hachura: bool = True,
 ) -> bytes:
     """Gera DXF de um único palito SPT. Retorna bytes."""
-    try:
-        import ezdxf
-    except ImportError:
-        raise ImportError("Adicione 'ezdxf>=1.1' ao requirements.txt")
-    doc = ezdxf.new("R2010")
-    doc.units = 6  # metros
-    _setup_layers(doc)
-    hatches = []
-    _palito(doc.modelspace(), sondagem, distancia, incluir_hachura, ox=0.0, hatches=hatches)
-    return _exportar(doc, hatches)
+    _handle[0] = 100
+    ents = _palito_str(sondagem, distancia, incluir_hachura, ox=0.0)
+    return _build_dxf(ents)
 
 
 def gerar_dxf_multiplas(
@@ -405,20 +321,13 @@ def gerar_dxf_multiplas(
     incluir_hachura: bool = True,
 ) -> bytes:
     """Gera DXF com múltiplos palitos lado a lado. Retorna bytes."""
-    try:
-        import ezdxf
-    except ImportError:
-        raise ImportError("Adicione 'ezdxf>=1.1' ao requirements.txt")
     if not sondagens:
         return b""
     if distancias is None:
         distancias = [0.0] * len(sondagens)
-    doc = ezdxf.new("R2010")
-    doc.units = 6
-    _setup_layers(doc)
-    msp = doc.modelspace()
-    hatches = []
+    _handle[0] = 100
+    ents = ""
     for i, (sond, dist) in enumerate(zip(sondagens, distancias)):
         if sond.metros:
-            _palito(msp, sond, dist, incluir_hachura, ox=i * espacamento_x, hatches=hatches)
-    return _exportar(doc, hatches)
+            ents += _palito_str(sond, dist, incluir_hachura, ox=i * espacamento_x)
+    return _build_dxf(ents)
