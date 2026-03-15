@@ -91,35 +91,49 @@ def _agrupar(metros: list) -> list:
     return hs
 
 
+def _hatch_raw(x1, y1, x2, y2, layer: str) -> str:
+    """
+    Gera string DXF de uma entidade HATCH SOLID para um retângulo.
+    Escrita diretamente no formato DXF para compatibilidade total.
+    """
+    return (
+        f"  0\nHATCH\n"
+        f"  5\nFF\n"          # handle placeholder
+        f"100\nAcDbEntity\n"
+        f"  8\n{layer}\n"
+        f" 62\n     7\n"       # cor branco/preto
+        f"100\nAcDbHatch\n"
+        f" 10\n0.0\n 20\n0.0\n 30\n0.0\n"  # elevation
+        f"210\n0.0\n220\n0.0\n230\n1.0\n"  # normal
+        f"  2\nSOLID\n"        # pattern name
+        f" 70\n     1\n"       # solid fill
+        f" 71\n     0\n"       # associativity
+        f" 91\n     1\n"       # number of boundary paths
+        f" 92\n     1\n"       # boundary type (external)
+        f" 93\n     4\n"       # number of vertices
+        f" 10\n{x1}\n 20\n{y1}\n"
+        f" 10\n{x2}\n 20\n{y1}\n"
+        f" 10\n{x2}\n 20\n{y2}\n"
+        f" 10\n{x1}\n 20\n{y2}\n"
+        f" 97\n     0\n"       # number of source objects
+        f" 75\n     1\n"       # hatch style
+        f" 76\n     1\n"       # hatch pattern type (predefined)
+        f" 98\n     0\n"       # number of seed points
+    )
+
+# Lista global de hachuras raw a injetar no DXF
+_raw_hatches: list = []
+
 def _add_solid_hatch(msp, pts: list, layer: str):
     """
-    Adiciona hachura SOLID usando ezdxf de forma compatível com todas as versões.
-    Tenta add_hatch com solid_fill; se falhar, usa SOLID pattern explícito.
+    Registra uma hachura SOLID para injeção posterior no DXF raw.
+    pts deve ter 4 pontos: [topo-esq, topo-dir, base-dir, base-esq]
     """
-    try:
-        ha = msp.add_hatch(dxfattribs={"layer": layer})
-        ha.set_solid_fill(color=7)
-        ha.paths.add_polyline_path(pts, is_closed=True)
-        return
-    except Exception:
-        pass
-    try:
-        ha = msp.add_hatch(dxfattribs={"layer": layer})
-        ha.set_pattern_fill("SOLID", scale=1.0)
-        ha.paths.add_polyline_path(pts, is_closed=True)
-        return
-    except Exception:
-        pass
-    # Fallback final: SOLID fill via dxf direto
-    try:
-        import ezdxf
-        ha = msp.add_hatch(dxfattribs={"layer": layer})
-        ha.dxf.solid_fill = 1
-        ha.dxf.pattern_name = "SOLID"
-        ha.dxf.pattern_type = 1
-        ha.paths.add_polyline_path(pts, is_closed=True)
-    except Exception:
-        pass
+    # Calcular bounding box dos pontos
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    _raw_hatches.append((min(xs), min(ys), max(xs), max(ys), layer))
+
 
 
 def _setup_layers(doc):
@@ -142,22 +156,39 @@ def _setup_layers(doc):
 
 
 def _exportar(doc) -> bytes:
+    """Exporta DXF e injeta hachuras SOLID raw antes do ENDSEC final."""
     import tempfile, os
+
     buf = io.BytesIO()
     try:
         doc.write(buf)
         buf.seek(0)
         data = buf.read()
-        if data:
-            return data
     except Exception:
-        pass
-    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-        tmp_path = tmp.name
-    doc.saveas(tmp_path)
-    with open(tmp_path, "rb") as f:
-        data = f.read()
-    os.unlink(tmp_path)
+        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+            tmp_path = tmp.name
+        doc.saveas(tmp_path)
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.unlink(tmp_path)
+
+    # Injetar hachuras SOLID como texto DXF raw
+    if _raw_hatches:
+        try:
+            texto = data.decode("latin-1")
+            hatches_str = ""
+            for x1, y1, x2, y2, layer in _raw_hatches:
+                hatches_str += _hatch_raw(x1, y1, x2, y2, layer)
+            # Inserir antes do último ENDSEC (fim da seção ENTITIES)
+            marker = "  0\nENDSEC"
+            idx = texto.rfind(marker)
+            if idx >= 0:
+                texto = texto[:idx] + hatches_str + texto[idx:]
+            data = texto.encode("latin-1", errors="replace")
+        except Exception:
+            pass
+        _raw_hatches.clear()
+
     return data
 
 
