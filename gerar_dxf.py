@@ -296,7 +296,15 @@ def _palito(sond, dist, hachura, ox=0.0):
 def _build(entidades):
     _H[0] = 0x8000
     before, after = _tmpl()
-    return (before + entidades + after).encode('latin-1', errors='replace')
+    dxf_txt = before + entidades + after
+
+    # Atualizar $HANDSEED para ser maior que o maior handle gerado
+    # O Civil 3D rejeita DXFs onde handles excedem o $HANDSEED do header
+    novo_seed = f"{_H[0] + 0x100:X}"
+    dxf_txt = re.sub(r'(\$HANDSEED\n\s*5\n)([0-9A-Fa-f]+)', 
+                     r'\g<1>' + novo_seed, dxf_txt, count=1)
+
+    return dxf_txt.encode('latin-1', errors='replace')
 
 
 # ---------------------------------------------------------------------------
