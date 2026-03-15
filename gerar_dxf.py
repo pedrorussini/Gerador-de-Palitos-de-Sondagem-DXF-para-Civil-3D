@@ -18,23 +18,26 @@ import io
 
 
 # ---------------------------------------------------------------------------
-# Constantes (unidades CAD = metros)
+# Constantes (unidades CAD — escala 10:1, 10 unidades = 1 metro)
+# Corresponde exatamente ao modelo sondagempadrao.dxf
 # ---------------------------------------------------------------------------
+_S         = 10.0   # fator de escala: 10 unidades CAD = 1 metro real
+
 PAL_X      = 0.0    # X da linha do palito
 PAL_Y0     = 0.0    # Y do topo do palito (prof=0)
 
-NSPT_X     = 0.20   # NSPT à direita do palito
-NSPT_H     = 0.20   # altura do texto NSPT
+NSPT_X     = 2.0    # NSPT à direita (= 0.2m * 10)
+NSPT_H     = 2.0    # altura texto NSPT (= 0.2m * 10)
 
-DESC_X     = -0.20  # Descrição à esquerda (alinhamento RIGHT)
-DESC_H     = 0.085  # altura do texto de descrição
-DESC_LARG  = 2.4    # comprimento das linhas de horizonte
+DESC_X     = -2.0   # Descrição à esquerda (= -0.2m * 10)
+DESC_H     = 0.85   # altura texto descrição (= 0.085m * 10)
+DESC_LARG  = 24.0   # comprimento linhas horizonte (= 2.4m * 10)
 
-CAB_X      = 0.20   # Cabeçalho à direita do palito
-CAB_H_TXT  = 0.185  # altura do texto do cabeçalho
+CAB_X      = 2.0    # Cabeçalho à direita (= 0.2m * 10)
+CAB_H_TXT  = 1.85   # altura texto cabeçalho (= 0.185m * 10)
 
-NA_X       = 2.4    # NA bem à direita
-NA_H       = 0.20
+NA_X       = 24.0   # NA bem à direita (= 2.4m * 10)
+NA_H       = 2.0    # altura texto NA
 
 # Layers (nomes exatos do modelo)
 LY_PALITO  = "furoSondagem"
@@ -62,15 +65,9 @@ _HACHURAS = {
 
 
 def _y(prof: float) -> float:
-    return PAL_Y0 - prof
+    """Converte profundidade (metros) para Y no DXF (10 unidades por metro)."""
+    return PAL_Y0 - prof * _S
 
-
-def _hachura(desc: str) -> tuple:
-    d = desc.lower()
-    for k, v in _HACHURAS.items():
-        if k in d:
-            return v
-    return ("ANSI31", 45, 0.05)
 
 
 def _agrupar(metros: list) -> list:
@@ -95,6 +92,12 @@ def _agrupar(metros: list) -> list:
 
 
 def _setup_layers(doc):
+    # Estilo de texto ARIAL (igual ao modelo)
+    if "ARIAL" not in doc.styles:
+        style = doc.styles.add("ARIAL")
+        style.dxf.font = "arial.ttf"
+        style.dxf.height = 0.0
+
     for nome, cor, lw in [
         (LY_PALITO, 7,  50),   # branco/preto
         (LY_NSPT,   3,  -3),   # verde
@@ -151,8 +154,8 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         dxfattribs={
             "layer":           LY_NSPT,
             "char_height":     CAB_H_TXT,
-            "attachment_point": 7,   # BOTTOM_LEFT
-            "insert":          (X(CAB_X), y_topo + 0.5),
+            "style": "ARIAL", "attachment_point": 7,   # BOTTOM_LEFT
+            "insert":          (X(CAB_X), y_topo + 5.0),
         }
     )
 
@@ -165,12 +168,12 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         dxfattribs={"layer": LY_PALITO, "lineweight": 50}
     )
 
-    # Divisórias a cada metro
+    # Divisórias a cada metro (traço curto de 0.5m * 10 = 5 unidades)
     for m in range(1, int(prof_max) + 1):
         ym = _y(float(m))
         msp.add_line(
             (X(PAL_X), ym),
-            (X(PAL_X - 0.5), ym),
+            (X(PAL_X - 5.0), ym),
             dxfattribs={"layer": LY_PALITO, "lineweight": 13}
         )
 
@@ -184,13 +187,13 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
             dxfattribs={
                 "layer":           LY_NSPT,
                 "char_height":     NSPT_H,
-                "attachment_point": 5,  # MIDDLE_CENTER
+                "style": "ARIAL", "attachment_point": 5,  # MIDDLE_CENTER
                 "insert":          (X(NSPT_X), yc),
             }
         )
 
     # ----------------------------------------------------------------
-    # HORIZONTES — descrição à esquerda + linha de horizonte + hachura
+    # HORIZONTES — descrição à esquerda + linha de horizonte
     # ----------------------------------------------------------------
     horizontes = _agrupar(metros)
 
@@ -198,9 +201,8 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         yi   = _y(h["pi"])
         yf   = _y(h["pf"])
         ym   = (yi + yf) / 2.0
-        alt  = abs(yi - yf)
 
-        # Linha horizontal de limite do horizonte (saindo do palito para esquerda)
+        # Linha horizontal de limite superior do horizonte
         msp.add_line(
             (X(PAL_X), yi),
             (X(PAL_X - DESC_LARG), yi),
@@ -220,26 +222,33 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
             dxfattribs={
                 "layer":           LY_DESC,
                 "char_height":     DESC_H,
-                "attachment_point": 6,   # MIDDLE_RIGHT
+                "style": "ARIAL", "attachment_point": 6,   # MIDDLE_RIGHT
                 "insert":          (X(DESC_X), ym),
                 "width":           DESC_LARG,
             }
         )
 
-        # Hachura
-        if hachura and alt > 0.05:
-            pat, ang, sc = _hachura(h["desc"])
-            try:
-                ha = msp.add_hatch(dxfattribs={"layer": LY_GEOT})
-                ha.set_pattern_fill(pat, scale=sc, angle=ang)
-                ha.paths.add_polyline_path([
-                    (X(PAL_X),              yi),
-                    (X(PAL_X - DESC_LARG),  yi),
-                    (X(PAL_X - DESC_LARG),  yf),
-                    (X(PAL_X),              yf),
-                ], is_closed=True)
-            except Exception:
-                pass
+    # ----------------------------------------------------------------
+    # HACHURA SOLID — metros ímpares (1,3,5,7,9...) dentro do palito
+    # Padrão alternado: metro ímpar = preenchido, metro par = vazio
+    # Largura do palito: x=-0.5 a x=+0.5 (1 unidade = 0.1m real)
+    # ----------------------------------------------------------------
+    if hachura:
+        for m in range(1, int(prof_max) + 1):
+            if m % 2 == 1:  # metros ímpares
+                y_topo_m = _y(float(m - 1))
+                y_base_m = _y(float(m))
+                try:
+                    ha = msp.add_hatch(dxfattribs={"layer": LY_GEOT})
+                    ha.set_solid_fill()
+                    ha.paths.add_polyline_path([
+                        (X(PAL_X - 5.0), y_topo_m),
+                        (X(PAL_X + 5.0), y_topo_m),
+                        (X(PAL_X + 5.0), y_base_m),
+                        (X(PAL_X - 5.0), y_base_m),
+                    ], is_closed=True)
+                except Exception:
+                    pass
 
     # ----------------------------------------------------------------
     # NÍVEL D'ÁGUA
@@ -250,7 +259,7 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         # Linha indicativa
         msp.add_line(
             (X(PAL_X), yna),
-            (X(PAL_X + 0.3), yna),
+            (X(PAL_X + 3.0), yna),
             dxfattribs={"layer": LY_NA, "lineweight": 25}
         )
         msp.add_mtext(
@@ -258,7 +267,7 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
             dxfattribs={
                 "layer":           LY_NA,
                 "char_height":     NA_H,
-                "attachment_point": 4,   # MIDDLE_LEFT
+                "style": "ARIAL", "attachment_point": 4,   # MIDDLE_LEFT
                 "insert":          (X(NA_X), yna),
             }
         )
@@ -273,10 +282,10 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         dxfattribs={"layer": LY_IMPEN, "lineweight": 50}
     )
     # Linhas tracejadas de impenetrável
-    for dx in [0.3, 0.6, 0.9, 1.2]:
+    for dx in [3.0, 6.0, 9.0, 12.0]:
         msp.add_line(
-            (X(PAL_X - dx + 0.1), y_fundo),
-            (X(PAL_X - dx - 0.1), y_fundo - 0.15),
+            (X(PAL_X - dx + 1.0), y_fundo),
+            (X(PAL_X - dx - 1.0), y_fundo - 1.5),
             dxfattribs={"layer": LY_IMPEN, "lineweight": 25}
         )
 
@@ -287,8 +296,8 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
         dxfattribs={
             "layer":           LY_NSPT,
             "char_height":     CAB_H_TXT,
-            "attachment_point": 5,   # MIDDLE_CENTER
-            "insert":          (X(CAB_X), y_fundo - 0.5),
+            "style": "ARIAL", "attachment_point": 5,   # MIDDLE_CENTER
+            "insert":          (X(CAB_X + 4.0), y_fundo - 5.0),
         }
     )
 
@@ -317,7 +326,7 @@ def gerar_dxf_sondagem(
 def gerar_dxf_multiplas(
     sondagens: list,
     distancias: list = None,
-    espacamento_x: float = 15.0,
+    espacamento_x: float = 150.0,
     incluir_hachura: bool = True,
 ) -> bytes:
     """Gera DXF com múltiplos palitos lado a lado. Retorna bytes."""
