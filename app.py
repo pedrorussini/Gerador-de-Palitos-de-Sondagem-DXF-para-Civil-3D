@@ -87,7 +87,25 @@ sondagens_finais = []
 distancias_finais = []
 
 for idx, (nome_pdf, sond) in enumerate(sondagens_raw):
-    with st.expander(f"📋 {sond.nome} — {nome_pdf}", expanded=True):
+    # Avaliar qualidade da extração
+    metros_com_desc = sum(1 for m in sond.metros if m.descricao)
+    pct_desc = metros_com_desc / len(sond.metros) * 100 if sond.metros else 0
+    if pct_desc >= 80:
+        qualidade = "✅ Boa"
+    elif pct_desc >= 50:
+        qualidade = "⚠️ Parcial"
+    else:
+        qualidade = "❌ Incompleta"
+
+    with st.expander(
+        f"📋 {sond.nome} — {len(sond.metros)} metros | Extração: {qualidade} ({pct_desc:.0f}% com descrição)",
+        expanded=True
+    ):
+        if pct_desc < 80:
+            st.warning(
+                f"⚠️ Apenas {metros_com_desc} de {len(sond.metros)} metros têm descrição extraída. "
+                "Complete os campos em branco na tabela abaixo antes de exportar."
+            )
 
         # Cabeçalho editável
         col_a, col_b, col_c, col_d = st.columns(4)
