@@ -1,84 +1,68 @@
 """
-gerar_dxf.py — Gera DXF de palito de sondagem SPT para Civil 3D.
+gerar_dxf.py — Gera DXF de palito SPT fiel ao modelo padrão brasileiro.
 
-Layout fiel ao modelo padrão brasileiro (baseado na imagem de referência):
+Estrutura baseada na análise do arquivo sondagempadrao.dxf:
 
-  ┌─────────────────────────────────┐
-  │         SP-33C-4-001            │  ← cabeçalho (amarelo)
-  │         ALT: 13.790             │
-  │         DIST: 0.000             │
-  └─────────────────────────────────┘
-  Argila siltoarenosa,  │▓▓│  1      ← descrição esq | palito | prof dir
-  marrom mole.          │  │
-  ──────────────────────┼──┤
-  Areia fina argilosa,  │▓▓│  2
-  cinza pouco compacta. │  │  NSPT
-                        │  │   7
+  Escala: 1 unidade CAD = 1 metro real (escala 1:100 no papel)
 
-Escala 1:100 — 1 metro = 1 unidade CAD
+  PAL_X = 0.0  → linha vertical do palito (layer furoSondagem)
+  NSPT:  x=+0.2, à DIREITA do palito (layer BR100, h=0.20)
+  DESC:  x=-0.2, à ESQUERDA alinhado à direita (layer BR60, h=0.085)
+         formato: "ORIG - Descrição.: prof_ini-prof_fim"
+  CAB:   MTEXT à direita (x=+0.2), texto "SP-XXX\nALT: X,XXX\nDIST: X,XXX"
+  NA:    texto à direita (x=+2.4, layer Nível D'Água)
+  Linhas de horizonte: horizontais de x=0 até x=-2.4 (layer furoSondagem)
 """
 
 import io
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Constantes de layout (unidades CAD — 1 = 1m em escala 1:100)
+# Constantes (unidades CAD = metros)
 # ---------------------------------------------------------------------------
+PAL_X      = 0.0    # X da linha do palito
+PAL_Y0     = 0.0    # Y do topo do palito (prof=0)
 
-CAB_H     = 3.5    # altura do cabeçalho
-PAL_X     = 5.5    # X da borda esquerda do palito
-PAL_W     = 0.8    # largura do palito
-PAL_Y0    = CAB_H  # Y do topo do palito (= base do cabeçalho)
+NSPT_X     = 0.20   # NSPT à direita do palito
+NSPT_H     = 0.20   # altura do texto NSPT
 
-# Coluna de descrição: à esquerda do palito
-DESC_X_MAX = PAL_X - 0.3   # borda direita da descrição (alinha à direita do palito)
-DESC_LARG  = 5.0            # largura da coluna de descrição
+DESC_X     = -0.20  # Descrição à esquerda (alinhamento RIGHT)
+DESC_H     = 0.085  # altura do texto de descrição
+DESC_LARG  = 2.4    # comprimento das linhas de horizonte
 
-# NSPT: número pequeno à ESQUERDA do palito, entre descrição e palito
-NSPT_X     = PAL_X - 0.15  # alinhado à direita da coluna NSPT
+CAB_X      = 0.20   # Cabeçalho à direita do palito
+CAB_H_TXT  = 0.185  # altura do texto do cabeçalho
 
-# Profundidade: à DIREITA do palito a cada metro
-PROF_X     = PAL_X + PAL_W + 0.25
+NA_X       = 2.4    # NA bem à direita
+NA_H       = 0.20
 
-# Cabeçalho centralizado no palito
-CAB_CX     = PAL_X + PAL_W / 2.0
+# Layers (nomes exatos do modelo)
+LY_PALITO  = "furoSondagem"
+LY_NSPT    = "BR100"
+LY_DESC    = "BR60"
+LY_NA      = "Nível D'Água"
+LY_IMPEN   = "Impenetrável"
+LY_GEOT    = "BGEOT-VT"     # hachuras/polígonos de solo
 
-# Alturas de texto
-TXT_TITULO = 0.45
-TXT_NORMAL = 0.25
-TXT_DESC   = 0.22
-TXT_ORIG   = 0.20
-
-# Hachuras por palavra-chave na descrição
+# Hachuras por tipo de solo
 _HACHURAS = {
-    "argila":        ("ANSI31",  45, 0.5),
-    "argiloso":      ("ANSI31",  45, 0.5),
-    "silte":         ("ANSI37",  45, 0.4),
-    "siltoso":       ("ANSI37",  45, 0.4),
-    "areia":         ("AR-SAND",  0, 0.8),
-    "arenoso":       ("AR-SAND",  0, 0.8),
-    "pedregulho":    ("AR-CONC",  0, 0.5),
-    "organico":      ("GRASS",    0, 1.0),
-    "orgânico":      ("GRASS",    0, 1.0),
-    "aterro":        ("ANSI32",   0, 0.8),
-    "rocha":         ("ANSI36",   0, 0.7),
-    "impenetrável":  ("SOLID",    0, 1.0),
+    "argila":        ("ANSI31",  45, 0.05),
+    "argiloso":      ("ANSI31",  45, 0.05),
+    "silte":         ("ANSI37",  45, 0.04),
+    "siltoso":       ("ANSI37",  45, 0.04),
+    "areia":         ("AR-SAND",  0, 0.08),
+    "arenoso":       ("AR-SAND",  0, 0.08),
+    "pedregulho":    ("AR-CONC",  0, 0.05),
+    "organico":      ("GRASS",    0, 0.10),
+    "orgânico":      ("GRASS",    0, 0.10),
+    "aterro":        ("ANSI32",   0, 0.08),
+    "rocha":         ("ANSI36",   0, 0.07),
+    "impenetrável":  ("SOLID",    0, 1.00),
 }
-
-# Layers e cores AutoCAD
-LY_CAB    = "SONDAGEM_CABECALHO"   # 2 = amarelo
-LY_PALITO = "SONDAGEM_PALITO"      # 7 = branco/preto
-LY_NSPT   = "SONDAGEM_NSPT"        # 5 = azul
-LY_TEXTO  = "SONDAGEM_TEXTO"       # 7
-LY_HACH   = "SONDAGEM_HACHURA"     # 8 = cinza
-LY_NA     = "SONDAGEM_NA"          # 5 = azul
-LY_LIM    = "SONDAGEM_LIMITE"      # 3 = verde
 
 
 def _y(prof: float) -> float:
-    """Profundidade em metros → Y no DXF (negativo = para baixo)."""
-    return -(PAL_Y0 + prof)
+    return PAL_Y0 - prof
 
 
 def _hachura(desc: str) -> tuple:
@@ -86,33 +70,17 @@ def _hachura(desc: str) -> tuple:
     for k, v in _HACHURAS.items():
         if k in d:
             return v
-    return ("ANSI31", 45, 0.5)
-
-
-def _quebrar(texto: str, max_c: int = 24) -> list:
-    """Quebra texto em linhas de no máximo max_c caracteres."""
-    palavras = texto.split()
-    linhas, linha = [], ""
-    for p in palavras:
-        if len(linha) + len(p) + (1 if linha else 0) <= max_c:
-            linha += (" " + p if linha else p)
-        else:
-            if linha:
-                linhas.append(linha)
-            linha = p
-    if linha:
-        linhas.append(linha)
-    return linhas or [""]
+    return ("ANSI31", 45, 0.05)
 
 
 def _agrupar(metros: list) -> list:
-    """Agrupa metros com mesma descrição em horizontes."""
+    """Agrupa metros consecutivos com mesma descrição em horizontes."""
     if not metros:
         return []
     hs = []
     dc = (metros[0].descricao or "").strip()
     oc = (metros[0].origem or "").strip()
-    ini = 0.0
+    ini = metros[0].prof_m - 1.0
     for i, m in enumerate(metros):
         d = (m.descricao or "").strip()
         o = (m.origem or "").strip()
@@ -127,16 +95,20 @@ def _agrupar(metros: list) -> list:
 
 
 def _setup_layers(doc):
-    for nome, cor in [
-        (LY_CAB, 2), (LY_PALITO, 7), (LY_NSPT, 5),
-        (LY_TEXTO, 7), (LY_HACH, 8), (LY_NA, 5), (LY_LIM, 3),
+    for nome, cor, lw in [
+        (LY_PALITO, 7,  50),   # branco/preto
+        (LY_NSPT,   3,  -3),   # verde
+        (LY_DESC,   3,  -3),   # verde
+        (LY_NA,     5,  25),   # azul
+        (LY_IMPEN,  1,  25),   # vermelho
+        (LY_GEOT,   8,  -3),   # cinza
     ]:
         if nome not in doc.layers:
-            doc.layers.add(nome, color=cor)
+            l = doc.layers.add(nome, color=cor)
+            l.dxf.lineweight = lw
 
 
 def _exportar(doc) -> bytes:
-    """Exporta doc ezdxf para bytes — compatível com todas as versões."""
     import tempfile, os
     buf = io.BytesIO()
     try:
@@ -147,7 +119,6 @@ def _exportar(doc) -> bytes:
             return data
     except Exception:
         pass
-    # Fallback: arquivo temporário
     with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
         tmp_path = tmp.name
     doc.saveas(tmp_path)
@@ -158,7 +129,7 @@ def _exportar(doc) -> bytes:
 
 
 def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
-    """Desenha um palito completo no modelspace deslocado por ox."""
+    """Desenha um palito completo deslocado por ox."""
     from ezdxf.enums import TextEntityAlignment as TA
 
     metros   = sond.metros
@@ -169,119 +140,103 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
     def X(v): return v + ox
 
     # ----------------------------------------------------------------
-    # CABEÇALHO
+    # CABEÇALHO — MTEXT à direita do palito
+    # Texto multilinha: "SP-XXX\nALT: X,XXX\nDIST: X,XXX"
     # ----------------------------------------------------------------
-    cab_x0 = X(PAL_X - DESC_LARG - 0.5)
-    cab_x1 = X(PAL_X + PAL_W + 2.5)
+    cab_txt = (f"{sond.nome}\\PALT: {sond.cota_boca:.3f}".replace(".", ",")
+               + f"\\PDIST: {dist:.3f}".replace(".", ","))
 
-    # Borda do cabeçalho
-    msp.add_lwpolyline(
-        [(cab_x0, 0), (cab_x1, 0),
-         (cab_x1, -CAB_H), (cab_x0, -CAB_H), (cab_x0, 0)],
-        dxfattribs={"layer": LY_CAB, "lineweight": 50, "closed": True}
-    )
-    msp.add_line((cab_x0, -CAB_H), (cab_x1, -CAB_H),
-                 dxfattribs={"layer": LY_CAB, "lineweight": 50})
-
-    # Textos do cabeçalho
-    for txt, dy in [
-        (sond.nome,                    -0.70),
-        (f"ALT: {sond.cota_boca:.3f}", -1.50),
-        (f"DIST: {dist:.3f}",          -2.30),
-    ]:
-        altura = TXT_TITULO if dy == -0.70 else TXT_NORMAL
-        t = msp.add_text(txt, dxfattribs={"layer": LY_CAB, "height": altura})
-        t.set_placement((X(CAB_CX), dy), align=TA.MIDDLE_CENTER)
-
-    # ----------------------------------------------------------------
-    # PALITO — retângulo central
-    # ----------------------------------------------------------------
-    msp.add_lwpolyline(
-        [(X(PAL_X), y_topo), (X(PAL_X + PAL_W), y_topo),
-         (X(PAL_X + PAL_W), y_fundo), (X(PAL_X), y_fundo),
-         (X(PAL_X), y_topo)],
-        dxfattribs={"layer": LY_PALITO, "lineweight": 50, "closed": True}
+    msp.add_mtext(
+        cab_txt,
+        dxfattribs={
+            "layer":           LY_NSPT,
+            "char_height":     CAB_H_TXT,
+            "attachment_point": 7,   # BOTTOM_LEFT
+            "insert":          (X(CAB_X), y_topo + 0.5),
+        }
     )
 
-    # Divisórias a cada metro + cotas de profundidade à direita
+    # ----------------------------------------------------------------
+    # PALITO — linha vertical simples
+    # ----------------------------------------------------------------
+    msp.add_line(
+        (X(PAL_X), y_topo),
+        (X(PAL_X), y_fundo),
+        dxfattribs={"layer": LY_PALITO, "lineweight": 50}
+    )
+
+    # Divisórias a cada metro
     for m in range(1, int(prof_max) + 1):
         ym = _y(float(m))
-        # Traço horizontal
-        msp.add_line((X(PAL_X), ym), (X(PAL_X + PAL_W), ym),
-                     dxfattribs={"layer": LY_PALITO, "lineweight": 13})
-        # Cota de profundidade à direita do palito
-        t = msp.add_text(
-            str(m),
-            dxfattribs={"layer": LY_TEXTO, "height": TXT_NORMAL}
+        msp.add_line(
+            (X(PAL_X), ym),
+            (X(PAL_X - 0.5), ym),
+            dxfattribs={"layer": LY_PALITO, "lineweight": 13}
         )
-        t.set_placement((X(PROF_X), ym + 0.12), align=TA.LEFT)
 
     # ----------------------------------------------------------------
-    # NSPT — número à ESQUERDA do palito, centralizado no metro
-    # Posicionado entre a descrição e o palito (pequeno, alinhado à direita)
+    # NSPT — MTEXT à direita do palito, centrado no metro
     # ----------------------------------------------------------------
     for m in metros:
         yc = _y(m.prof_m - 0.5)
-        t = msp.add_text(
+        msp.add_mtext(
             str(m.nspt),
-            dxfattribs={"layer": LY_NSPT, "height": TXT_NORMAL}
+            dxfattribs={
+                "layer":           LY_NSPT,
+                "char_height":     NSPT_H,
+                "attachment_point": 5,  # MIDDLE_CENTER
+                "insert":          (X(NSPT_X), yc),
+            }
         )
-        # Alinhado à direita da coluna NSPT (encostado no palito, à esquerda)
-        t.set_placement((X(NSPT_X), yc + 0.12), align=TA.RIGHT)
 
     # ----------------------------------------------------------------
-    # HORIZONTES — descrição + origem à esquerda + hachura no palito
+    # HORIZONTES — descrição à esquerda + linha de horizonte + hachura
     # ----------------------------------------------------------------
     horizontes = _agrupar(metros)
 
     for h in horizontes:
-        yi  = _y(h["pi"])
-        yf  = _y(h["pf"])
-        ym  = (yi + yf) / 2.0
-        alt = abs(yi - yf)
+        yi   = _y(h["pi"])
+        yf   = _y(h["pf"])
+        ym   = (yi + yf) / 2.0
+        alt  = abs(yi - yf)
 
-        # Traço de limite superior (linha horizontal da borda do palito até a esquerda)
-        if h["pi"] > 0:
-            msp.add_line(
-                (X(PAL_X - DESC_LARG), yi),
-                (X(PAL_X), yi),
-                dxfattribs={"layer": LY_TEXTO, "lineweight": 13}
-            )
+        # Linha horizontal de limite do horizonte (saindo do palito para esquerda)
+        msp.add_line(
+            (X(PAL_X), yi),
+            (X(PAL_X - DESC_LARG), yi),
+            dxfattribs={"layer": LY_PALITO, "lineweight": 13}
+        )
 
-        # Montar linhas de texto: origem primeiro, depois descrição quebrada
-        linhas_txt = []
+        # Descrição: "ORIG - Descrição.: prof_ini-prof_fim"
+        pi_str = f"{h['pi']:.2f}".replace(".", ",")
+        pf_str = f"{h['pf']:.2f}".replace(".", ",")
         if h["orig"]:
-            linhas_txt.append((h["orig"], TXT_ORIG, True))   # (texto, altura, negrito)
-        for ln in _quebrar(h["desc"], max_c=24):
-            linhas_txt.append((ln, TXT_DESC, False))
+            desc_txt = f"{h['orig']} - {h['desc']}.: {pi_str}-{pf_str}"
+        else:
+            desc_txt = f"{h['desc']}.: {pi_str}-{pf_str}"
 
-        # Posicionar texto centralizado verticalmente no horizonte
-        n      = len(linhas_txt)
-        esp    = TXT_DESC * 1.8
-        y_ini  = ym + ((n - 1) * esp) / 2.0
+        msp.add_mtext(
+            desc_txt,
+            dxfattribs={
+                "layer":           LY_DESC,
+                "char_height":     DESC_H,
+                "attachment_point": 6,   # MIDDLE_RIGHT
+                "insert":          (X(DESC_X), ym),
+                "width":           DESC_LARG,
+            }
+        )
 
-        for j, (ln, altura, _bold) in enumerate(linhas_txt[:6]):
-            t = msp.add_text(
-                ln,
-                dxfattribs={"layer": LY_TEXTO, "height": altura}
-            )
-            # Alinha à direita, encostando no palito
-            t.set_placement(
-                (X(PAL_X - 0.25), y_ini - j * esp),
-                align=TA.RIGHT
-            )
-
-        # Hachura dentro do palito
+        # Hachura
         if hachura and alt > 0.05:
             pat, ang, sc = _hachura(h["desc"])
             try:
-                ha = msp.add_hatch(dxfattribs={"layer": LY_HACH})
+                ha = msp.add_hatch(dxfattribs={"layer": LY_GEOT})
                 ha.set_pattern_fill(pat, scale=sc, angle=ang)
                 ha.paths.add_polyline_path([
-                    (X(PAL_X),         yi),
-                    (X(PAL_X + PAL_W), yi),
-                    (X(PAL_X + PAL_W), yf),
-                    (X(PAL_X),         yf),
+                    (X(PAL_X),              yi),
+                    (X(PAL_X - DESC_LARG),  yi),
+                    (X(PAL_X - DESC_LARG),  yf),
+                    (X(PAL_X),              yf),
                 ], is_closed=True)
             except Exception:
                 pass
@@ -292,39 +247,50 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
     if sond.nivel_dagua and sond.nivel_dagua > 0:
         yna    = _y(sond.nivel_dagua)
         na_str = f"NA:{sond.nivel_dagua:.2f}".replace(".", ",")
-
-        # Linha horizontal + seta + texto
+        # Linha indicativa
         msp.add_line(
-            (X(PAL_X + PAL_W), yna),
-            (X(PAL_X + PAL_W + 2.0), yna),
+            (X(PAL_X), yna),
+            (X(PAL_X + 0.3), yna),
             dxfattribs={"layer": LY_NA, "lineweight": 25}
         )
-        # Triângulo indicativo (seta)
-        msp.add_solid(
-            [(X(PAL_X + PAL_W),        yna),
-             (X(PAL_X + PAL_W + 0.35), yna + 0.15),
-             (X(PAL_X + PAL_W + 0.35), yna - 0.15),
-             (X(PAL_X + PAL_W),        yna)],
-            dxfattribs={"layer": LY_NA}
+        msp.add_mtext(
+            na_str,
+            dxfattribs={
+                "layer":           LY_NA,
+                "char_height":     NA_H,
+                "attachment_point": 4,   # MIDDLE_LEFT
+                "insert":          (X(NA_X), yna),
+            }
         )
-        t = msp.add_text(na_str, dxfattribs={"layer": LY_NA, "height": TXT_NORMAL})
-        t.set_placement((X(PAL_X + PAL_W + 2.1), yna + 0.12), align=TA.LEFT)
 
     # ----------------------------------------------------------------
-    # LIMITE DE SONDAGEM + rodapé
+    # LIMITE DE SONDAGEM
     # ----------------------------------------------------------------
-    # Linha dupla na base
-    msp.add_line((X(PAL_X), y_fundo), (X(PAL_X + PAL_W), y_fundo),
-                 dxfattribs={"layer": LY_LIM, "lineweight": 70})
-    msp.add_line((X(PAL_X), y_fundo - 0.12), (X(PAL_X + PAL_W), y_fundo - 0.12),
-                 dxfattribs={"layer": LY_LIM, "lineweight": 25})
-
-    # Texto profundidade total
-    t = msp.add_text(
-        f"Prof.={prof_max:.2f}m".replace(".", ","),
-        dxfattribs={"layer": LY_TEXTO, "height": TXT_NORMAL}
+    # Linha final + rodapé
+    msp.add_line(
+        (X(PAL_X), y_fundo),
+        (X(PAL_X - DESC_LARG), y_fundo),
+        dxfattribs={"layer": LY_IMPEN, "lineweight": 50}
     )
-    t.set_placement((X(CAB_CX), y_fundo - 0.55), align=TA.MIDDLE_CENTER)
+    # Linhas tracejadas de impenetrável
+    for dx in [0.3, 0.6, 0.9, 1.2]:
+        msp.add_line(
+            (X(PAL_X - dx + 0.1), y_fundo),
+            (X(PAL_X - dx - 0.1), y_fundo - 0.15),
+            dxfattribs={"layer": LY_IMPEN, "lineweight": 25}
+        )
+
+    # Texto rodapé
+    prof_str = f"Prof.={prof_max:.2f}m".replace(".", ",")
+    msp.add_mtext(
+        prof_str,
+        dxfattribs={
+            "layer":           LY_NSPT,
+            "char_height":     CAB_H_TXT,
+            "attachment_point": 5,   # MIDDLE_CENTER
+            "insert":          (X(CAB_X), y_fundo - 0.5),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
