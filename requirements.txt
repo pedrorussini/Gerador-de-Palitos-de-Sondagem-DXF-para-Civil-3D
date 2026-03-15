@@ -1,0 +1,6 @@
+streamlit>=1.32
+pandas>=2.0
+openseespy
+pypandoc>=1.13
+pdfplumber>=0.10
+ezdxf>=1.1
