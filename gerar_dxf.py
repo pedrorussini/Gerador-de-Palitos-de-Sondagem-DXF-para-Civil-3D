@@ -91,6 +91,37 @@ def _agrupar(metros: list) -> list:
     return hs
 
 
+def _add_solid_hatch(msp, pts: list, layer: str):
+    """
+    Adiciona hachura SOLID usando ezdxf de forma compatível com todas as versões.
+    Tenta add_hatch com solid_fill; se falhar, usa SOLID pattern explícito.
+    """
+    try:
+        ha = msp.add_hatch(dxfattribs={"layer": layer})
+        ha.set_solid_fill(color=7)
+        ha.paths.add_polyline_path(pts, is_closed=True)
+        return
+    except Exception:
+        pass
+    try:
+        ha = msp.add_hatch(dxfattribs={"layer": layer})
+        ha.set_pattern_fill("SOLID", scale=1.0)
+        ha.paths.add_polyline_path(pts, is_closed=True)
+        return
+    except Exception:
+        pass
+    # Fallback final: SOLID fill via dxf direto
+    try:
+        import ezdxf
+        ha = msp.add_hatch(dxfattribs={"layer": layer})
+        ha.dxf.solid_fill = 1
+        ha.dxf.pattern_name = "SOLID"
+        ha.dxf.pattern_type = 1
+        ha.paths.add_polyline_path(pts, is_closed=True)
+    except Exception:
+        pass
+
+
 def _setup_layers(doc):
     # Estilo de texto ARIAL (igual ao modelo)
     if "ARIAL" not in doc.styles:
@@ -237,34 +268,12 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
             if m % 2 == 1:  # metros ímpares
                 y_topo_m = _y(float(m - 1))
                 y_base_m = _y(float(m))
-                try:
-                    ha = msp.add_hatch(
-                        color=7,
-                        dxfattribs={"layer": LY_GEOT}
-                    )
-                    # Hachura sólida: pattern_name="SOLID", solid_fill=1
-                    ha.set_pattern_fill("SOLID", scale=1.0, angle=0)
-                    ha.dxf.solid_fill = 1
-                    pts = [
-                        (X(PAL_X - 5.0), y_topo_m),
-                        (X(PAL_X + 5.0), y_topo_m),
-                        (X(PAL_X + 5.0), y_base_m),
-                        (X(PAL_X - 5.0), y_base_m),
-                    ]
-                    ha.paths.add_polyline_path(pts, is_closed=True)
-                except Exception:
-                    # Fallback: LWPOLYLINE preenchida (visualmente similar)
-                    try:
-                        pl = msp.add_lwpolyline(
-                            [(X(PAL_X - 5.0), y_topo_m),
-                             (X(PAL_X + 5.0), y_topo_m),
-                             (X(PAL_X + 5.0), y_base_m),
-                             (X(PAL_X - 5.0), y_base_m)],
-                            dxfattribs={"layer": LY_GEOT, "closed": True}
-                        )
-                        pl.dxf.const_width = 0
-                    except Exception:
-                        pass
+                _add_solid_hatch(msp, [
+                    (X(PAL_X - 5.0), y_topo_m),
+                    (X(PAL_X + 5.0), y_topo_m),
+                    (X(PAL_X + 5.0), y_base_m),
+                    (X(PAL_X - 5.0), y_base_m),
+                ], LY_GEOT)
 
     # ----------------------------------------------------------------
     # NÍVEL D'ÁGUA
