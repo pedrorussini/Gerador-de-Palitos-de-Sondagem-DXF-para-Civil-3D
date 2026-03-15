@@ -390,10 +390,12 @@ def _parse_geoloc_bbox(pagina) -> list:
                for i in range(1, len(metros_lista))]
     altura_metro = sum(alturas) / len(alturas) if alturas else 28.0
 
-    # Golpes
+    # Golpes — capturar APENAS as colunas 1ª, 2ª, 3ª (x < 18% da largura)
+    # O layout Geoloc/New Solos tem: 1ª(12%) | 2ª(14%) | 3ª(16%) | 1ª+2ª(20%) | 2ª+3ª(24%)
+    # Limitar a x < 18% garante que só pegamos os 3 golpes individuais
     y_ultimo_metro = max(metro_y.values())
     golpes_words = [w for w in words
-                    if W*0.04 < w["x0"] < W*0.24
+                    if W*0.04 < w["x0"] < W*0.18
                     and w["top"] > H*0.22
                     and w["top"] < y_ultimo_metro + 15
                     and _re.match(r"^\d{1,2}$", w["text"])
