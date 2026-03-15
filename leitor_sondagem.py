@@ -394,12 +394,21 @@ def _parse_geoloc_bbox(pagina) -> list:
     # O layout Geoloc/New Solos tem: 1ª(12%) | 2ª(14%) | 3ª(16%) | 1ª+2ª(20%) | 2ª+3ª(24%)
     # Limitar a x < 18% garante que só pegamos os 3 golpes individuais
     y_ultimo_metro = max(metro_y.values())
-    golpes_words = [w for w in words
-                    if W*0.04 < w["x0"] < W*0.18
-                    and w["top"] > H*0.22
-                    and w["top"] < y_ultimo_metro + 15
-                    and _re.match(r"^\d{1,2}$", w["text"])
-                    and 0 <= int(w["text"]) <= 60]
+    golpes_words_ind = [w for w in words
+                        if W*0.04 < w["x0"] < W*0.18
+                        and w["top"] > H*0.22
+                        and w["top"] < y_ultimo_metro + 15
+                        and _re.match(r"^\d{1,2}$", w["text"])
+                        and 0 <= int(w["text"]) <= 60]
+
+    # Colunas de soma: 1ª+2ª (x≈20%) e 2ª+3ª (x≈24%)
+    # Usadas como fallback quando as individuais não estão disponíveis
+    golpes_words_soma = [w for w in words
+                         if W*0.18 <= w["x0"] < W*0.27
+                         and w["top"] > H*0.22
+                         and w["top"] < y_ultimo_metro + 15
+                         and _re.match(r"^\d{1,2}$", w["text"])
+                         and 0 <= int(w["text"]) <= 60]
 
     metros_sorted = sorted(metro_y.keys())
 
@@ -413,11 +422,19 @@ def _parse_geoloc_bbox(pagina) -> list:
                 return n
         return None
 
+    # Mapear golpes individuais por metro
     golpes_por_metro = {}
-    for w in golpes_words:
+    for w in golpes_words_ind:
         n = _y_metro_v2((w["top"] + w["bottom"]) / 2)
         if n is not None:
             golpes_por_metro.setdefault(n, []).append(int(w["text"]))
+
+    # Mapear somas por metro (para fallback)
+    somas_por_metro = {}
+    for w in golpes_words_soma:
+        n = _y_metro_v2((w["top"] + w["bottom"]) / 2)
+        if n is not None:
+            somas_por_metro.setdefault(n, []).append(int(w["text"]))
 
     # Classificação (x > 65%)
     classif_words = [w for w in words
@@ -547,10 +564,22 @@ def _parse_geoloc_bbox(pagina) -> list:
         if n == 0: continue
         gs = sorted(golpes_por_metro.get(n, []))
         gs_validos = [g for g in gs if g != 15]
-        if len(gs_validos) >= 3:   g1,g2,g3 = gs_validos[0],gs_validos[1],gs_validos[2]
-        elif len(gs_validos) == 2: g1,g2,g3 = 0,gs_validos[0],gs_validos[1]
-        elif len(gs) >= 3:         g1,g2,g3 = gs[0],gs[1],gs[2]
-        else: continue
+        if len(gs_validos) >= 3:
+            g1,g2,g3 = gs_validos[0],gs_validos[1],gs_validos[2]
+        elif len(gs_validos) == 2:
+            g1,g2,g3 = 0,gs_validos[0],gs_validos[1]
+        elif len(gs) >= 3:
+            g1,g2,g3 = gs[0],gs[1],gs[2]
+        else:
+            # Fallback: usar colunas 1ª+2ª e 2ª+3ª quando individuais ausentes
+            ss = sorted(somas_por_metro.get(n, []))
+            if len(ss) >= 2:
+                # ss[0] = 1ª+2ª, ss[1] = 2ª+3ª → nspt = ss[1]
+                g1, g2, g3 = 0, 0, ss[1]
+            elif len(ss) == 1:
+                g1, g2, g3 = 0, 0, ss[0]
+            else:
+                continue
         metros_spt.append(MetroSPT(
             prof_m=float(n), nspt=g2+g3,
             golpes_1=g1, golpes_2=g2, golpes_3=g3,
