@@ -1,1 +1,4 @@
 pandoc
+libblas3
+liblapack3
+libgfortran5
