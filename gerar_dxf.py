@@ -1,62 +1,204 @@
 """
-gerar_dxf.py — Gera DXF de palito SPT escrevendo o formato diretamente.
+gerar_dxf.py — Gera DXF de palito SPT para Civil 3D.
 
-Sem dependência de ezdxf — escreve entidades DXF como texto puro.
-Compatível com AutoCAD / Civil 3D (formato R2010 / AC1024).
+Usa sondagempadrao.dxf como template (HEADER+TABLES+BLOCKS+OBJECTS)
+e substitui apenas a seção ENTITIES pelas entidades geradas dinamicamente.
 
-Estrutura baseada no modelo sondagempadrao.dxf:
-  - Escala: 10 unidades CAD = 1 metro real
-  - Palito: layer furoSondagem, linha vertical em x=0
-  - NSPT:   layer BR100, MTEXT à direita (x=+2), fonte ARIAL h=2.0
-  - Desc:   layer BR60,  MTEXT à esquerda (x=-2), fonte ARIAL h=0.85
-  - Hachura: layer BGEOT-VT, SOLID alternado nos metros ímpares
+Layout baseado no modelo original:
+  Escala: 1 unidade CAD = 1 metro
+  Palito: x=4.15 a x=4.25 (largura 0.1m), layer furoSondagem
+  Hachura SOLID: metros ímpares, layer BGEOT-VT
+  NSPT: x=4.40, h=0.2, layer BR100, fonte ARIAL
+  Desc: x=4.00, h=0.085, layer BR60, fonte ARIAL
+  Cab:  x=4.40, h=0.185, layer BR100
 """
 
-import io
+import gzip, base64, os, re
 
 # ---------------------------------------------------------------------------
-# Escala e posições (10 unidades = 1 metro)
+# Layout — coordenadas exatas do modelo
 # ---------------------------------------------------------------------------
-S          = 10.0   # fator de escala
+PAL_XE   = 4.15
+PAL_XD   = 4.25
+PAL_XC   = 4.20
 
-PAL_X      = 0.0
-NSPT_X     = 2.0
-DESC_X     = -2.0
-DESC_LARG  = 24.0
-CAB_X      = 2.0
-NA_X       = 24.0
+NSPT_X   = 4.40
+DESC_X   = 4.00
+DESC_W   = 4.00
+CAB_X    = 4.40
+CAB_W    = 5.00
+NA_X     = 6.60
+PROF_X   = 4.80
+BALIZA_X = 4.60
+HORIZ_X  = 1.77
 
-H_NSPT     = 2.0
-H_DESC     = 0.85
-H_CAB      = 1.85
-H_NA       = 2.0
+H_CAB    = 0.185
+H_NSPT   = 0.20
+H_DESC   = 0.085
+H_NA     = 0.20
+H_PROF   = 0.20
 
 LY_PAL   = "furoSondagem"
 LY_NSPT  = "BR100"
 LY_DESC  = "BR60"
-LY_NA    = "Nível D'Água"
-LY_IMPEN = "Impenetrável"
+LY_NA    = "Nivel Dagua"
+LY_IMPEN = "Impenetravel"
 LY_HACH  = "BGEOT-VT"
 
 
-def _y(prof: float) -> float:
-    return -(prof * S)
+# ---------------------------------------------------------------------------
+# Template (carregado dos arquivos .gz64)
+# ---------------------------------------------------------------------------
+_CACHE = {}
+
+def _tmpl():
+    if _CACHE:
+        return _CACHE['b'], _CACHE['a']
+    base = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [base, os.getcwd(), os.path.expanduser('~')]
+    for key, fname in [('b', 'dxf_before.gz64'), ('a', 'dxf_after.gz64')]:
+        loaded = False
+        for d in search_dirs:
+            path = os.path.join(d, fname)
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = f.read().strip()
+                _CACHE[key] = gzip.decompress(base64.b64decode(data)).decode('latin-1')
+                loaded = True
+                break
+        if not loaded:
+            raise FileNotFoundError(
+                f"{fname} não encontrado. Coloque junto com gerar_dxf.py."
+            )
+    return _CACHE['b'], _CACHE['a']
 
 
-def _agrupar(metros: list) -> list:
+# ---------------------------------------------------------------------------
+# Handles
+# ---------------------------------------------------------------------------
+_H = [0x8000]
+
+def _h():
+    _H[0] += 1
+    return f"{_H[0]:X}"
+
+
+def _y(prof):
+    return _y.topo - prof
+
+_y.topo = 17.116
+
+
+# ---------------------------------------------------------------------------
+# Primitivas DXF (estrutura idêntica ao modelo)
+# ---------------------------------------------------------------------------
+
+def _line(x1, y1, x2, y2, layer):
+    return (
+        f"  0\nLINE\n  5\n{_h()}\n330\n1F\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbLine\n"
+        f" 10\n{x1}\n 20\n{y1}\n 30\n0.0\n"
+        f" 11\n{x2}\n 21\n{y2}\n 31\n0.0\n"
+    )
+
+
+def _mtext(text, x, y, height, layer, width=4.0, attach=1):
+    n_lines = text.count('^J') + 1
+    box_h   = height * n_lines * 1.5
+    return (
+        f"  0\nMTEXT\n  5\n{_h()}\n330\n1F\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbMText\n"
+        f" 10\n{x}\n 20\n{y}\n 30\n0.0\n"
+        f" 40\n{height}\n"
+        f" 41\n{width}\n"
+        f" 46\n{box_h}\n"
+        f" 71\n{attach:6d}\n"
+        f" 72\n     5\n"
+        f"  1\n{text}\n"
+        f"  7\nARIAL\n"
+        f" 73\n     1\n"
+        f" 44\n1.0\n"
+    )
+
+
+def _hatch_solid(x1, y1, x2, y2, layer):
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return (
+        f"  0\nHATCH\n  5\n{_h()}\n330\n1F\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbHatch\n"
+        f" 10\n0.0\n 20\n0.0\n 30\n0.0\n"
+        f"210\n0.0\n220\n0.0\n230\n1.0\n"
+        f"  2\nSOLID\n"
+        f" 70\n     1\n"
+        f" 71\n     0\n"
+        f" 91\n        1\n"
+        f" 92\n        2\n"
+        f" 72\n     0\n"
+        f" 73\n     1\n"
+        f" 93\n        4\n"
+        f" 10\n{x1}\n 20\n{y1}\n"
+        f" 10\n{x2}\n 20\n{y1}\n"
+        f" 10\n{x2}\n 20\n{y2}\n"
+        f" 10\n{x1}\n 20\n{y2}\n"
+        f" 97\n        0\n"
+        f" 75\n     0\n"
+        f" 76\n     1\n"
+        f" 98\n        1\n"
+        f" 10\n{cx}\n 20\n{cy}\n"
+        f"450\n        0\n451\n        0\n"
+        f"460\n0.0\n461\n0.0\n"
+        f"452\n        0\n462\n0.0\n"
+        f"453\n        0\n470\n\n"
+    )
+
+
+def _lwpoly(pts, layer):
+    n = len(pts)
+    verts = "".join(f" 10\n{x}\n 20\n{y}\n" for x, y in pts)
+    return (
+        f"  0\nLWPOLYLINE\n  5\n{_h()}\n330\n1F\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbPolyline\n"
+        f" 90\n{n:8d}\n"
+        f" 70\n     1\n"
+        f" 43\n0.0\n"
+        + verts
+    )
+
+
+def _insert(block, x, y, scale, layer):
+    return (
+        f"  0\nINSERT\n  5\n{_h()}\n330\n1F\n"
+        f"100\nAcDbEntity\n  8\n{layer}\n"
+        f"100\nAcDbBlockReference\n"
+        f"  2\n{block}\n"
+        f" 10\n{x}\n 20\n{y}\n 30\n0.0\n"
+        f" 41\n{scale}\n 42\n{scale}\n 43\n{scale}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agrupamento
+# ---------------------------------------------------------------------------
+
+def _agrupar(metros):
     if not metros:
         return []
-    hs = []
-    dc = (metros[0].descricao or "").strip()
-    oc = (metros[0].origem or "").strip()
+    hs  = []
+    dc  = (metros[0].descricao or "").strip()
+    oc  = (metros[0].origem    or "").strip()
     ini = metros[0].prof_m - 1.0
     for i, m in enumerate(metros):
         d = (m.descricao or "").strip()
-        o = (m.origem or "").strip()
+        o = (m.origem    or "").strip()
         if d and d != dc and i > 0:
             hs.append({"pi": ini, "pf": m.prof_m - 1.0, "desc": dc, "orig": oc})
             ini = m.prof_m - 1.0
-            dc = d
+            dc  = d
         if o:
             oc = o
     hs.append({"pi": ini, "pf": metros[-1].prof_m, "desc": dc, "orig": oc})
@@ -64,270 +206,118 @@ def _agrupar(metros: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Escritores de entidades DXF
+# Palito
 # ---------------------------------------------------------------------------
 
-_handle = [1000]  # contador de handles
-
-def _h():
-    _handle[0] += 1
-    return f"{_handle[0]:X}"
-
-
-def line(x1, y1, x2, y2, layer, lw=25):
-    return (
-        f"  0\nLINE\n  5\n{_h()}\n"
-        f"100\nAcDbEntity\n  8\n{layer}\n"
-        f"100\nAcDbLine\n"
-        f" 10\n{x1:.4f}\n 20\n{y1:.4f}\n 30\n0.0\n"
-        f" 11\n{x2:.4f}\n 21\n{y2:.4f}\n 31\n0.0\n"
-    )
-
-
-def mtext(text, x, y, height, layer, width=0.0, attach=7):
-    """
-    attach: 1=TL 2=TC 3=TR 4=ML 5=MC 6=MR 7=BL 8=BC 9=BR
-    """
-    w = f" 41\n{width:.4f}\n" if width > 0 else ""
-    return (
-        f"  0\nMTEXT\n  5\n{_h()}\n"
-        f"100\nAcDbEntity\n  8\n{layer}\n"
-        f"100\nAcDbMText\n"
-        f" 10\n{x:.4f}\n 20\n{y:.4f}\n 30\n0.0\n"
-        f" 40\n{height:.4f}\n"
-        f"{w}"
-        f" 71\n{attach}\n"
-        f"  7\nARIAL\n"
-        f"  1\n{text}\n"
-    )
-
-
-def hatch_solid(x1, y1, x2, y2, layer):
-    """Hachura SOLID para retângulo definido por (x1,y1)-(x2,y2)."""
-    return (
-        f"  0\nHATCH\n  5\n{_h()}\n"
-        f"100\nAcDbEntity\n  8\n{layer}\n 62\n     7\n"
-        f"100\nAcDbHatch\n"
-        f" 10\n0.0\n 20\n0.0\n 30\n0.0\n"
-        f"210\n0.0\n220\n0.0\n230\n1.0\n"
-        f"  2\nSOLID\n"
-        f" 70\n     1\n"   # solid fill
-        f" 71\n     0\n"   # not associative
-        f" 91\n     1\n"   # 1 boundary path
-        f" 92\n     1\n"   # external boundary
-        f" 93\n     4\n"   # 4 vertices
-        f" 10\n{x1:.4f}\n 20\n{y1:.4f}\n"
-        f" 10\n{x2:.4f}\n 20\n{y1:.4f}\n"
-        f" 10\n{x2:.4f}\n 20\n{y2:.4f}\n"
-        f" 10\n{x1:.4f}\n 20\n{y2:.4f}\n"
-        f" 97\n     0\n"   # no source objects
-        f" 75\n     1\n"   # hatch style = normal
-        f" 76\n     1\n"   # predefined pattern
-        f" 47\n0.0\n"      # pixel size
-        f" 98\n     0\n"   # no seed points
-    )
-
-
-# ---------------------------------------------------------------------------
-# Cabeçalho DXF
-# ---------------------------------------------------------------------------
-
-def _header():
-    return """\
-  0
-SECTION
-  2
-HEADER
-  9
-$ACADVER
-  1
-AC1015
-  9
-$INSUNITS
- 70
-6
-  9
-$MEASUREMENT
- 70
-1
-  0
-ENDSEC
-"""
-
-
-def _tables():
-    return (
-        "  0\nSECTION\n  2\nTABLES\n"
-        # LAYER table
-        "  0\nTABLE\n  2\nLAYER\n  5\n2\n100\nAcDbSymbolTable\n 70\n    20\n"
-        + _layer_entry(LY_PAL,   7,  0)
-        + _layer_entry(LY_NSPT,  3,  0)   # verde
-        + _layer_entry(LY_DESC,  3,  0)   # verde
-        + _layer_entry(LY_NA,    5,  0)   # azul
-        + _layer_entry(LY_IMPEN, 1,  0)   # vermelho
-        + _layer_entry(LY_HACH,  8,  0)   # cinza
-        + "  0\nENDTAB\n"
-        # STYLE table com ARIAL
-        "  0\nTABLE\n  2\nSTYLE\n  5\n3\n100\nAcDbSymbolTable\n 70\n     2\n"
-        "  0\nSTYLE\n  5\n11\n100\nAcDbSymbolTableRecord\n100\nAcDbTextStyleTableRecord\n"
-        "  2\nStandard\n 70\n     0\n 40\n0.0\n 41\n1.0\n 50\n0.0\n 71\n     0\n"
-        "  3\ntxt\n  4\n\n"
-        "  0\nSTYLE\n  5\n12\n100\nAcDbSymbolTableRecord\n100\nAcDbTextStyleTableRecord\n"
-        "  2\nARIAL\n 70\n     0\n 40\n0.0\n 41\n1.0\n 50\n0.0\n 71\n     0\n"
-        "  3\narial.ttf\n  4\n\n"
-        "  0\nENDTAB\n"
-        "  0\nENDSEC\n"
-    )
-
-
-def _layer_entry(name, color, lw):
-    return (
-        f"  0\nLAYER\n  5\n{_h()}\n"
-        f"100\nAcDbSymbolTableRecord\n"
-        f"100\nAcDbLayerTableRecord\n"
-        f"  2\n{name}\n"
-        f" 70\n     0\n"
-        f" 62\n{color:6d}\n"
-        f"  6\nContinuous\n"
-        f"370\n    25\n"
-    )
-
-
-def _blocks():
-    return (
-        "  0\nSECTION\n  2\nBLOCKS\n"
-        "  0\nBLOCK\n  5\nF0\n100\nAcDbEntity\n  8\n0\n"
-        "100\nAcDbBlockBegin\n  2\n*Model_Space\n 70\n     0\n"
-        " 10\n0.0\n 20\n0.0\n 30\n0.0\n  3\n*Model_Space\n  1\n\n"
-        "  0\nENDBLK\n  5\nF1\n100\nAcDbEntity\n  8\n0\n100\nAcDbBlockEnd\n"
-        "  0\nENDSEC\n"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Construção do palito
-# ---------------------------------------------------------------------------
-
-def _palito_str(sond, dist: float, hachura: bool, ox: float = 0.0) -> str:
+def _palito(sond, dist, hachura, ox=0.0):
     metros   = sond.metros
     prof_max = sond.profundidade_total
+    _y.topo  = 17.116
     y_topo   = _y(0.0)
     y_fundo  = _y(prof_max)
-    out      = []
 
     def X(v): return v + ox
 
-    # Cabeçalho: MTEXT multilinha à direita
-    cab = f"{sond.nome}\\PALT: {sond.cota_boca:.3f}".replace(".", ",")
-    cab += f"\\PDIST: {dist:.3f}".replace(".", ",")
-    out.append(mtext(cab, X(CAB_X), y_topo + S*0.5, H_CAB, LY_NSPT, attach=7))
+    out = []
 
-    # Linha vertical do palito
-    out.append(line(X(PAL_X), y_topo, X(PAL_X), y_fundo, LY_PAL, lw=50))
+    # Cabeçalho
+    cab = (f"{sond.nome}^J"
+           f"ALT: {sond.cota_boca:.3f}^J"
+           f"DIST: {dist:.3f}").replace(".", ",")
+    out.append(_mtext(cab, X(CAB_X), y_topo + 0.6, H_CAB, LY_NSPT,
+                      width=CAB_W, attach=4))
 
-    # Divisórias a cada metro + NSPT
+    # Linha vertical BR100 acima do cabeçalho
+    out.append(_line(X(PAL_XC), y_topo, X(PAL_XC), y_topo + 0.8, LY_NSPT))
+
+    # Borda do palito (LWPOLYLINE)
+    out.append(_lwpoly([
+        (X(PAL_XE), y_topo),
+        (X(PAL_XD), y_topo),
+        (X(PAL_XD), y_fundo),
+        (X(PAL_XE), y_fundo),
+    ], LY_PAL))
+
+    # NSPT por metro
     for m in metros:
-        ym = _y(float(m.prof_m))
-        # Traço curto saindo do palito
-        out.append(line(X(PAL_X), ym, X(PAL_X - 5.0), ym, LY_PAL, lw=13))
-        # NSPT centralizado no metro, à direita
+        ym = _y(m.prof_m)
         yc = _y(m.prof_m - 0.5)
-        out.append(mtext(str(m.nspt), X(NSPT_X), yc, H_NSPT, LY_NSPT, attach=5))
+        out.append(_line(X(PAL_XC), ym, X(PAL_XC), ym, LY_PAL))
+        out.append(_mtext(str(m.nspt), X(NSPT_X), yc, H_NSPT, LY_NSPT,
+                          width=3.0, attach=1))
 
-    # Horizontes: descrição + linha de limite
+    # Horizontes
     for h in _agrupar(metros):
         yi  = _y(h["pi"])
         yf  = _y(h["pf"])
         ym  = (yi + yf) / 2.0
 
-        # Linha horizontal de limite do horizonte
-        out.append(line(X(PAL_X), yi, X(PAL_X - DESC_LARG), yi, LY_PAL, lw=13))
+        out.append(_line(X(PAL_XC), yi, X(PAL_XC), yi, LY_PAL))
+        out.append(_line(X(PAL_XE), yi, X(HORIZ_X), yi, LY_PAL))
 
-        # Texto: "ORIG - Desc.: pi-pf"
         pi_s = f"{h['pi']:.2f}".replace(".", ",")
         pf_s = f"{h['pf']:.2f}".replace(".", ",")
         txt  = (f"{h['orig']} - {h['desc']}.: {pi_s}-{pf_s}"
                 if h["orig"] else f"{h['desc']}.: {pi_s}-{pf_s}")
-        # Quebrar linhas longas com \P (MTEXT newline)
-        out.append(mtext(txt, X(DESC_X), ym, H_DESC, LY_DESC,
-                         width=DESC_LARG, attach=6))
+        out.append(_mtext(txt, X(DESC_X), ym, H_DESC, LY_DESC,
+                          width=DESC_W, attach=3))
 
-    # Hachura SOLID alternada — metros ímpares
+    # Hachura SOLID metros ímpares + linhas baliza
     if hachura:
         for m in range(1, int(prof_max) + 1):
+            yt = _y(m - 1)
+            yb = _y(m)
             if m % 2 == 1:
-                yt = _y(float(m - 1))
-                yb = _y(float(m))
-                out.append(hatch_solid(X(PAL_X - 5.0), yb,
-                                       X(PAL_X + 5.0), yt, LY_HACH))
+                out.append(_hatch_solid(X(PAL_XE), yb, X(PAL_XD), yt, LY_HACH))
+            out.append(_line(X(BALIZA_X), yb, X(PAL_XD), yb, LY_HACH))
 
-    # NA
+    # Nível d'água (INSERT do bloco NA)
     if sond.nivel_dagua and sond.nivel_dagua > 0:
-        yna    = _y(sond.nivel_dagua)
-        na_str = f"NA:{sond.nivel_dagua:.2f}".replace(".", ",")
-        out.append(line(X(PAL_X), yna, X(PAL_X + 3.0), yna, LY_NA, lw=25))
-        out.append(mtext(na_str, X(NA_X), yna, H_NA, LY_NA, attach=4))
+        yna = _y(sond.nivel_dagua)
+        out.append(_insert("NA", X(NA_X), yna, 0.2, LY_HACH))
+        out.append(_mtext(f"NA:{sond.nivel_dagua:.2f}".replace(".", ","),
+                          X(NA_X), yna, H_NA, LY_NSPT, width=2.0, attach=8))
 
-    # Limite de sondagem
-    out.append(line(X(PAL_X), y_fundo, X(PAL_X - DESC_LARG), y_fundo, LY_IMPEN, lw=50))
-    for dx in [3.0, 6.0, 9.0, 12.0, 15.0]:
-        out.append(line(X(PAL_X - dx + 1.0), y_fundo,
-                        X(PAL_X - dx - 1.0), y_fundo - 1.5, LY_IMPEN, lw=25))
+    # Impenetrável (INSERT do bloco)
+    out.append(_insert("impenetravel", X(PAL_XC), y_fundo, 0.2, "BLC"))
 
     # Rodapé
-    prof_str = f"Prof.={prof_max:.2f}m".replace(".", ",")
-    out.append(mtext(prof_str, X(CAB_X + 4.0), y_fundo - S*0.5, H_CAB, LY_NSPT, attach=5))
+    out.append(_mtext(f"Prof.={prof_max:.2f}m".replace(".", ","),
+                      X(PROF_X), y_fundo - 0.5, H_PROF, LY_NSPT,
+                      width=1.0, attach=5))
 
     return "".join(out)
 
 
 # ---------------------------------------------------------------------------
-# Montar DXF completo
+# Build DXF
 # ---------------------------------------------------------------------------
 
-def _build_dxf(entidades: str) -> bytes:
-    _handle[0] = 100  # reset handle
-    dxf = (
-        _header()
-        + _tables()
-        + _blocks()
-        + "  0\nSECTION\n  2\nENTITIES\n"
-        + entidades
-        + "  0\nENDSEC\n"
-        + "  0\nEOF\n"
-    )
-    return dxf.encode("latin-1", errors="replace")
+def _build(entidades):
+    _H[0] = 0x8000
+    before, after = _tmpl()
+    return (before + entidades + after).encode('latin-1', errors='replace')
 
 
 # ---------------------------------------------------------------------------
-# Funções públicas
+# API pública
 # ---------------------------------------------------------------------------
 
-def gerar_dxf_sondagem(
-    sondagem,
-    distancia: float = 0.0,
-    incluir_hachura: bool = True,
-) -> bytes:
+def gerar_dxf_sondagem(sondagem, distancia=0.0, incluir_hachura=True):
     """Gera DXF de um único palito SPT. Retorna bytes."""
-    _handle[0] = 100
-    ents = _palito_str(sondagem, distancia, incluir_hachura, ox=0.0)
-    return _build_dxf(ents)
+    return _build(_palito(sondagem, distancia, incluir_hachura, ox=0.0))
 
 
-def gerar_dxf_multiplas(
-    sondagens: list,
-    distancias: list = None,
-    espacamento_x: float = 150.0,
-    incluir_hachura: bool = True,
-) -> bytes:
+def gerar_dxf_multiplas(sondagens, distancias=None,
+                        espacamento_x=15.0, incluir_hachura=True):
     """Gera DXF com múltiplos palitos lado a lado. Retorna bytes."""
     if not sondagens:
         return b""
     if distancias is None:
         distancias = [0.0] * len(sondagens)
-    _handle[0] = 100
-    ents = ""
-    for i, (sond, dist) in enumerate(zip(sondagens, distancias)):
-        if sond.metros:
-            ents += _palito_str(sond, dist, incluir_hachura, ox=i * espacamento_x)
-    return _build_dxf(ents)
+    ents = "".join(
+        _palito(s, d, incluir_hachura, ox=i * espacamento_x)
+        for i, (s, d) in enumerate(zip(sondagens, distancias))
+        if s.metros
+    )
+    return _build(ents)
