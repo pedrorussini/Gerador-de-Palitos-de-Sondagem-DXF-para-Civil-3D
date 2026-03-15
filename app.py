@@ -119,6 +119,17 @@ for idx, (nome_pdf, sond) in enumerate(sondagens_raw):
                                         value=float(sond.nivel_dagua or 0.0),
                                         step=0.01, format="%.2f", key=f"na_{idx}")
 
+        # Detectar descrições provavelmente truncadas (terminam com palavra de ligação)
+        _truncadas = [m for m in sond.metros
+                      if m.descricao and m.descricao.rstrip().split()[-1].lower()
+                      in {"com", "e", "de", "a", "em", "ou", "que", "para", "do", "da"}]
+        if _truncadas:
+            st.warning(
+                f"⚠️ {len(_truncadas)} descrição(ões) parecem incompletas "
+                f"(terminam com 'com', 'e', 'de'...). "
+                "Complete-as na tabela antes de exportar."
+            )
+
         st.markdown("**Metros extraídos — complete descrição e origem onde estiver em branco:**")
 
         # Tabela editável de metros
