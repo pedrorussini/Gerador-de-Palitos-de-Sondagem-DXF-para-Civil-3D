@@ -48,42 +48,119 @@ if not pdfs:
     st.info("⬆️ Faça upload de pelo menos um PDF para continuar.")
     st.stop()
 
-sondagens = []
-distancias = []
+sondagens_raw = []
 erros = []
 
 for pdf_file in pdfs:
     try:
-        sond = ler_pdf_sondagem(pdf_file)
-        if sond is None or not sond.metros:
+        resultado = ler_pdf_sondagem(pdf_file)
+        # ler_pdf_sondagem pode retornar objeto único ou lista
+        if resultado is None:
             erros.append((pdf_file.name, "Nenhum dado extraído"))
             continue
-        sondagens.append(sond)
-        distancias.append(0.0)
+        if isinstance(resultado, list):
+            lista = resultado
+        else:
+            lista = [resultado]
+        for s in lista:
+            if hasattr(s, 'metros') and s.metros:
+                sondagens_raw.append((pdf_file.name, s))
+            else:
+                erros.append((pdf_file.name, "Nenhum metro extraído"))
     except Exception as e:
         erros.append((pdf_file.name, str(e)))
 
 for nome, msg in erros:
     st.warning(f"⚠️ {nome}: {msg}")
 
-if not sondagens:
+if not sondagens_raw:
     st.error("❌ Nenhuma sondagem pôde ser lida. Verifique os PDFs enviados.")
     st.stop()
 
-st.subheader(f"✅ {len(sondagens)} sondagem(ns) lida(s)")
+st.subheader(f"✅ {len(sondagens_raw)} sondagem(ns) lida(s) — revise e complete antes de exportar")
+st.caption("Os campos em branco não foram encontrados no PDF. Preencha antes de gerar o DXF.")
 
-for sond in sondagens:
-    with st.expander(f"📋 {sond.nome} — {sond.profundidade_total:.1f} m", expanded=False):
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Profundidade total", f"{sond.profundidade_total:.1f} m")
-        col_b.metric("Altitude (cota boca)", f"{sond.cota_boca:.3f} m")
-        col_c.metric("Nível d'água", f"{sond.nivel_dagua:.2f} m" if sond.nivel_dagua else "—")
-        df_prev = pd.DataFrame([
-            {"Prof. (m)": m.prof_m, "NSPT": m.nspt,
-             "Descrição": (m.descricao or "")[:50], "Origem": m.origem or ""}
+# ----------------------------------------------------------------
+# TELA DE REVISÃO — editável por sondagem
+# ----------------------------------------------------------------
+sondagens_finais = []
+distancias_finais = []
+
+for idx, (nome_pdf, sond) in enumerate(sondagens_raw):
+    with st.expander(f"📋 {sond.nome} — {nome_pdf}", expanded=True):
+
+        # Cabeçalho editável
+        col_a, col_b, col_c, col_d = st.columns(4)
+        nome_edit = col_a.text_input("Identificação", value=sond.nome,
+                                      key=f"nome_{idx}")
+        cota_edit = col_b.number_input("Cota boca (m)", value=float(sond.cota_boca or 0.0),
+                                        step=0.001, format="%.3f", key=f"cota_{idx}")
+        dist_edit = col_c.number_input("Distância ao eixo (m)", value=0.0,
+                                        step=0.001, format="%.3f", key=f"dist_{idx}")
+        na_edit   = col_d.number_input("Nível d'água (m) — 0 = ausente",
+                                        value=float(sond.nivel_dagua or 0.0),
+                                        step=0.01, format="%.2f", key=f"na_{idx}")
+
+        st.markdown("**Metros extraídos — complete descrição e origem onde estiver em branco:**")
+
+        # Tabela editável de metros
+        df_edit = pd.DataFrame([
+            {
+                "Prof. (m)":   m.prof_m,
+                "NSPT":        m.nspt,
+                "g1":          m.golpes_1,
+                "g2":          m.golpes_2,
+                "g3":          m.golpes_3,
+                "Descrição":   m.descricao or "",
+                "Origem":      m.origem or "",
+            }
             for m in sond.metros
         ])
-        st.dataframe(df_prev, use_container_width=True, hide_index=True, height=200)
+
+        df_resultado = st.data_editor(
+            df_edit,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "Prof. (m)": st.column_config.NumberColumn("Prof. (m)", format="%.2f", min_value=0.0),
+                "NSPT":      st.column_config.NumberColumn("NSPT", min_value=0, max_value=999),
+                "g1":        st.column_config.NumberColumn("g1", min_value=0),
+                "g2":        st.column_config.NumberColumn("g2", min_value=0),
+                "g3":        st.column_config.NumberColumn("g3", min_value=0),
+                "Descrição": st.column_config.TextColumn("Descrição", width="large"),
+                "Origem":    st.column_config.TextColumn("Origem", width="small",
+                             help="Ex: SRM, SRJ, SS, AT"),
+            },
+            key=f"editor_{idx}",
+        )
+
+        # Reconstruir SondagemSPT com os dados editados
+        from leitor_sondagem import SondagemSPT, MetroSPT
+        novos_metros = []
+        for _, row in df_resultado.iterrows():
+            novos_metros.append(MetroSPT(
+                prof_m    = float(row["Prof. (m)"]),
+                nspt      = int(row["NSPT"]),
+                golpes_1  = int(row.get("g1", 0)),
+                golpes_2  = int(row.get("g2", 0)),
+                golpes_3  = int(row.get("g3", 0)),
+                descricao = str(row["Descrição"]),
+                origem    = str(row["Origem"]),
+            ))
+
+        sond_final = SondagemSPT(
+            nome        = nome_edit,
+            cota_boca   = cota_edit,
+            nivel_dagua = na_edit if na_edit > 0 else None,
+            metros      = novos_metros,
+        )
+        sondagens_finais.append(sond_final)
+        distancias_finais.append(dist_edit)
+
+# Renomear para uso no restante do código
+sondagens = sondagens_finais
+distancias = distancias_finais
 
 st.markdown("---")
 st.subheader("⬇️ Exportar DXF")
