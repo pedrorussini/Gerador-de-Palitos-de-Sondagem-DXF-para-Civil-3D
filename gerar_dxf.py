@@ -238,16 +238,33 @@ def _palito(msp, sond, dist: float, hachura: bool, ox: float = 0.0):
                 y_topo_m = _y(float(m - 1))
                 y_base_m = _y(float(m))
                 try:
-                    ha = msp.add_hatch(dxfattribs={"layer": LY_GEOT})
-                    ha.set_solid_fill()
-                    ha.paths.add_polyline_path([
+                    ha = msp.add_hatch(
+                        color=7,
+                        dxfattribs={"layer": LY_GEOT}
+                    )
+                    # Hachura sólida: pattern_name="SOLID", solid_fill=1
+                    ha.set_pattern_fill("SOLID", scale=1.0, angle=0)
+                    ha.dxf.solid_fill = 1
+                    pts = [
                         (X(PAL_X - 5.0), y_topo_m),
                         (X(PAL_X + 5.0), y_topo_m),
                         (X(PAL_X + 5.0), y_base_m),
                         (X(PAL_X - 5.0), y_base_m),
-                    ], is_closed=True)
+                    ]
+                    ha.paths.add_polyline_path(pts, is_closed=True)
                 except Exception:
-                    pass
+                    # Fallback: LWPOLYLINE preenchida (visualmente similar)
+                    try:
+                        pl = msp.add_lwpolyline(
+                            [(X(PAL_X - 5.0), y_topo_m),
+                             (X(PAL_X + 5.0), y_topo_m),
+                             (X(PAL_X + 5.0), y_base_m),
+                             (X(PAL_X - 5.0), y_base_m)],
+                            dxfattribs={"layer": LY_GEOT, "closed": True}
+                        )
+                        pl.dxf.const_width = 0
+                    except Exception:
+                        pass
 
     # ----------------------------------------------------------------
     # NÍVEL D'ÁGUA
