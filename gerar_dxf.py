@@ -236,6 +236,33 @@ def _palito(msp, sond, dist, hachura, ox=0.0):
     t.set_placement((X(CAB_CX), yf - 0.6), align=TA.MIDDLE_CENTER)
 
 
+
+def _exportar(doc) -> bytes:
+    """Exporta documento ezdxf para bytes de forma compatível com todas as versões."""
+    import tempfile, os
+    # Método 1: BytesIO direto (ezdxf >= 0.17)
+    try:
+        buf = io.BytesIO()
+        doc.write(buf)
+        buf.seek(0)
+        data = buf.read()
+        if data:
+            return data
+    except Exception:
+        pass
+    # Método 2: arquivo temporário (fallback universal)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+            tmp_path = tmp.name
+        doc.saveas(tmp_path)
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.unlink(tmp_path)
+        return data
+    except Exception as e:
+        raise RuntimeError(f"Não foi possível exportar DXF: {e}")
+
+
 def gerar_dxf_sondagem(sondagem, distancia=0.0, incluir_hachura=True):
     """Gera DXF de um único palito. Retorna bytes."""
     try:
@@ -246,9 +273,7 @@ def gerar_dxf_sondagem(sondagem, distancia=0.0, incluir_hachura=True):
     doc.units = 6
     _setup_layers(doc)
     _palito(doc.modelspace(), sondagem, distancia, incluir_hachura, ox=0.0)
-    buf = io.BytesIO()
-    doc.write(buf)
-    return buf.getvalue()
+    return _exportar(doc)
 
 
 def gerar_dxf_multiplas(sondagens, distancias=None, espacamento_x=15.0, incluir_hachura=True):
@@ -268,6 +293,4 @@ def gerar_dxf_multiplas(sondagens, distancias=None, espacamento_x=15.0, incluir_
     for i, (sond, dist) in enumerate(zip(sondagens, distancias)):
         if sond.metros:
             _palito(msp, sond, dist, incluir_hachura, ox=i * espacamento_x)
-    buf = io.BytesIO()
-    doc.write(buf)
-    return buf.getvalue()
+    return _exportar(doc)
