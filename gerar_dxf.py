@@ -94,8 +94,7 @@ def _agrupar(metros: list) -> list:
 def _setup_layers(doc):
     # Estilo de texto ARIAL (igual ao modelo)
     if "ARIAL" not in doc.styles:
-        style = doc.styles.add("ARIAL")
-        style.dxf.font = "arial.ttf"
+        style = doc.styles.add("ARIAL", font="arial.ttf")
         style.dxf.height = 0.0
 
     for nome, cor, lw in [
