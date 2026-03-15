@@ -1,252 +1,217 @@
+"""
+app.py — Gerador de Palitos de Sondagem SPT em DXF para Civil 3D
+"""
+
 import streamlit as st
 import pandas as pd
-import os
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
+import io
+import zipfile
 
-try:
-    from leitor_sondagem import ler_pdf_sondagem
-    from gerar_dxf import gerar_dxf_sondagem, gerar_dxf_multiplas
-    MODULOS_OK = True
-except ImportError as e:
-    MODULOS_OK = False
-    _import_erro = str(e)
+from leitor_sondagem import ler_pdf_sondagem, SondagemSPT, MetroSPT
+from gerar_dxf import gerar_dxf_sondagem, gerar_dxf_multiplas
 
 st.set_page_config(
-    page_title="Gerador de Palitos SPT — DXF para Civil 3D",
+    page_title="Gerador de Palitos SPT",
     page_icon="🗂️",
-    layout="centered",
+    layout="wide",
 )
 
 st.title("🗂️ Gerador de Palitos de Sondagem SPT")
-st.caption("Faça upload dos PDFs de sondagem e baixe os palitos prontos para o Civil 3D.")
+st.caption("Upload de PDFs de boletim → revisão → export DXF para Civil 3D")
 
-if not MODULOS_OK:
-    st.error(f"❌ Módulo não encontrado: {_import_erro}")
-    st.stop()
-
-st.markdown("---")
-
-pdfs = st.file_uploader(
-    "📎 Selecione um ou mais PDFs de sondagem SPT",
+# ---------------------------------------------------------------------------
+# Upload de PDFs
+# ---------------------------------------------------------------------------
+uploaded = st.file_uploader(
+    "📄 Selecione os PDFs de sondagem",
     type=["pdf"],
     accept_multiple_files=True,
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    incluir_hachura = st.checkbox("Incluir hachuras de solo", value=True)
-with col2:
-    espacamento = st.number_input(
-        "Espaçamento entre palitos (m)", value=15.0, step=1.0, min_value=5.0,
-        help="Distância horizontal entre palitos no DXF quando há múltiplas sondagens"
-    )
-
-st.markdown("---")
-
-if not pdfs:
-    st.info("⬆️ Faça upload de pelo menos um PDF para continuar.")
+if not uploaded:
+    st.info("Faça upload de um ou mais PDFs de boletim de sondagem SPT.")
     st.stop()
 
-sondagens_raw = []
-erros = []
+# ---------------------------------------------------------------------------
+# Leitura dos PDFs
+# ---------------------------------------------------------------------------
+if "sondagens_raw" not in st.session_state or st.button("🔄 Reler PDFs"):
+    sondagens_raw = []
+    erros = []
+    with st.spinner("Lendo PDFs..."):
+        for f in uploaded:
+            try:
+                data = f.read()
+                sonds = ler_pdf_sondagem(io.BytesIO(data))
+                for s in sonds:
+                    sondagens_raw.append((f.name, s))
+            except Exception as e:
+                erros.append(f"{f.name}: {e}")
+    st.session_state["sondagens_raw"] = sondagens_raw
+    if erros:
+        for e in erros:
+            st.error(f"❌ {e}")
 
-for pdf_file in pdfs:
-    try:
-        resultado = ler_pdf_sondagem(pdf_file)
-        # ler_pdf_sondagem pode retornar objeto único ou lista
-        if resultado is None:
-            erros.append((pdf_file.name, "Nenhum dado extraído"))
-            continue
-        if isinstance(resultado, list):
-            lista = resultado
-        else:
-            lista = [resultado]
-        for s in lista:
-            if hasattr(s, 'metros') and s.metros:
-                sondagens_raw.append((pdf_file.name, s))
-            else:
-                erros.append((pdf_file.name, "Nenhum metro extraído"))
-    except Exception as e:
-        erros.append((pdf_file.name, str(e)))
-
-for nome, msg in erros:
-    st.warning(f"⚠️ {nome}: {msg}")
+sondagens_raw = st.session_state.get("sondagens_raw", [])
 
 if not sondagens_raw:
-    st.error("❌ Nenhuma sondagem pôde ser lida. Verifique os PDFs enviados.")
+    st.warning("Nenhuma sondagem encontrada nos PDFs enviados.")
     st.stop()
 
-st.subheader(f"✅ {len(sondagens_raw)} sondagem(ns) lida(s) — revise e complete antes de exportar")
-st.caption("Os campos em branco não foram encontrados no PDF. Preencha antes de gerar o DXF.")
+st.success(f"✅ {len(sondagens_raw)} sondagem(ns) encontrada(s).")
 
-# ----------------------------------------------------------------
-# TELA DE REVISÃO — editável por sondagem
-# ----------------------------------------------------------------
-sondagens_finais = []
-distancias_finais = []
+# ---------------------------------------------------------------------------
+# Revisão editável por sondagem
+# ---------------------------------------------------------------------------
+sondagens_editadas: list[SondagemSPT] = []
 
 for idx, (nome_pdf, sond) in enumerate(sondagens_raw):
-    # Avaliar qualidade da extração
+
+    # Indicador de qualidade
     metros_com_desc = sum(1 for m in sond.metros if m.descricao)
     pct_desc = metros_com_desc / len(sond.metros) * 100 if sond.metros else 0
-    if pct_desc >= 80:
-        qualidade = "✅ Boa"
-    elif pct_desc >= 50:
-        qualidade = "⚠️ Parcial"
-    else:
-        qualidade = "❌ Incompleta"
+    if pct_desc >= 80:   qualidade = "✅ Boa"
+    elif pct_desc >= 50: qualidade = "⚠️ Parcial"
+    else:                qualidade = "❌ Incompleta"
 
     with st.expander(
-        f"📋 {sond.nome} — {len(sond.metros)} metros | Extração: {qualidade} ({pct_desc:.0f}% com descrição)",
-        expanded=True
+        f"📋 {sond.nome} — {len(sond.metros)} metros | "
+        f"Extração: {qualidade} ({pct_desc:.0f}% com descrição)",
+        expanded=True,
     ):
         if pct_desc < 80:
             st.warning(
-                f"⚠️ Apenas {metros_com_desc} de {len(sond.metros)} metros têm descrição extraída. "
-                "Complete os campos em branco na tabela abaixo antes de exportar."
+                f"⚠️ Apenas {metros_com_desc}/{len(sond.metros)} metros com descrição. "
+                "Complete os campos em branco antes de exportar."
+            )
+
+        # Detectar descrições truncadas
+        _truncadas = [
+            m for m in sond.metros
+            if m.descricao and m.descricao.rstrip().split()[-1].lower()
+            in {"com", "e", "de", "a", "em", "ou", "que", "para", "do", "da"}
+        ]
+        if _truncadas:
+            st.warning(
+                f"⚠️ {len(_truncadas)} descrição(ões) parecem incompletas "
+                "(terminam com 'com', 'e', 'de'...). Complete na tabela."
             )
 
         # Cabeçalho editável
         col_a, col_b, col_c, col_d = st.columns(4)
-        nome_edit = col_a.text_input("Identificação", value=sond.nome,
-                                      key=f"nome_{idx}")
-        cota_edit = col_b.number_input("Cota boca (m)", value=float(sond.cota_boca or 0.0),
-                                        step=0.001, format="%.3f", key=f"cota_{idx}")
-        dist_edit = col_c.number_input("Distância ao eixo (m)", value=0.0,
-                                        step=0.001, format="%.3f", key=f"dist_{idx}")
-        na_edit   = col_d.number_input("Nível d'água (m) — 0 = ausente",
-                                        value=float(sond.nivel_dagua or 0.0),
-                                        step=0.01, format="%.2f", key=f"na_{idx}")
+        nome_ed  = col_a.text_input("Nome",  value=sond.nome,       key=f"nome_{idx}")
+        cota_ed  = col_b.number_input("Cota (m)", value=float(sond.cota_boca),
+                                      step=0.001, format="%.3f",    key=f"cota_{idx}")
+        na_ed    = col_c.number_input("NA (m)", value=float(sond.nivel_dagua or 0.0),
+                                      step=0.1, format="%.2f",      key=f"na_{idx}")
+        dist_ed  = col_d.number_input("Dist. (m)", value=0.0,
+                                      step=0.001, format="%.3f",    key=f"dist_{idx}")
 
-        # Detectar descrições provavelmente truncadas (terminam com palavra de ligação)
-        _truncadas = [m for m in sond.metros
-                      if m.descricao and m.descricao.rstrip().split()[-1].lower()
-                      in {"com", "e", "de", "a", "em", "ou", "que", "para", "do", "da"}]
-        if _truncadas:
-            st.warning(
-                f"⚠️ {len(_truncadas)} descrição(ões) parecem incompletas "
-                f"(terminam com 'com', 'e', 'de'...). "
-                "Complete-as na tabela antes de exportar."
-            )
-
+        # Tabela editável
         st.markdown("**Metros extraídos — complete descrição e origem onde estiver em branco:**")
 
-        # Tabela editável de metros
-        df_edit = pd.DataFrame([
-            {
-                "Prof. (m)":   m.prof_m,
-                "NSPT":        m.nspt,
-                "g1":          m.golpes_1,
-                "g2":          m.golpes_2,
-                "g3":          m.golpes_3,
-                "Descrição":   m.descricao or "",
-                "Origem":      m.origem or "",
-            }
-            for m in sond.metros
-        ])
+        df = pd.DataFrame([{
+            "Prof. (m)":  m.prof_m,
+            "NSPT":       m.nspt,
+            "g1":         m.golpes_1,
+            "g2":         m.golpes_2,
+            "g3":         m.golpes_3,
+            "Origem":     m.origem,
+            "Descrição":  m.descricao,
+        } for m in sond.metros])
 
-        df_resultado = st.data_editor(
-            df_edit,
-            use_container_width=True,
-            hide_index=True,
+        df_ed = st.data_editor(
+            df,
             num_rows="dynamic",
-            column_config={
-                "Prof. (m)": st.column_config.NumberColumn("Prof. (m)", format="%.2f", min_value=0.0),
-                "NSPT":      st.column_config.NumberColumn("NSPT", min_value=0, max_value=999),
-                "g1":        st.column_config.NumberColumn("g1", min_value=0),
-                "g2":        st.column_config.NumberColumn("g2", min_value=0),
-                "g3":        st.column_config.NumberColumn("g3", min_value=0),
-                "Descrição": st.column_config.TextColumn("Descrição", width="large"),
-                "Origem":    st.column_config.TextColumn("Origem", width="small",
-                             help="Ex: SRM, SRJ, SS, AT"),
-            },
-            key=f"editor_{idx}",
-        )
-
-        # Reconstruir SondagemSPT com os dados editados
-        from leitor_sondagem import SondagemSPT, MetroSPT
-        novos_metros = []
-        for _, row in df_resultado.iterrows():
-            novos_metros.append(MetroSPT(
-                prof_m    = float(row["Prof. (m)"]),
-                nspt      = int(row["NSPT"]),
-                golpes_1  = int(row.get("g1", 0)),
-                golpes_2  = int(row.get("g2", 0)),
-                golpes_3  = int(row.get("g3", 0)),
-                descricao = str(row["Descrição"]),
-                origem    = str(row["Origem"]),
-            ))
-
-        sond_final = SondagemSPT(
-            nome        = nome_edit,
-            cota_boca   = cota_edit,
-            nivel_dagua = na_edit if na_edit > 0 else None,
-            metros      = novos_metros,
-        )
-        sondagens_finais.append(sond_final)
-        distancias_finais.append(dist_edit)
-
-# Renomear para uso no restante do código
-sondagens = sondagens_finais
-distancias = distancias_finais
-
-st.markdown("---")
-st.subheader("⬇️ Exportar DXF")
-
-if len(sondagens) == 1:
-    try:
-        dxf_bytes = gerar_dxf_sondagem(
-            sondagens[0], distancia=0.0, incluir_hachura=incluir_hachura)
-        st.download_button(
-            label=f"📥 Baixar {sondagens[0].nome}.dxf",
-            data=dxf_bytes,
-            file_name=f"{sondagens[0].nome}.dxf",
-            mime="application/dxf",
             use_container_width=True,
-            type="primary",
+            key=f"tabela_{idx}",
+            column_config={
+                "Prof. (m)": st.column_config.NumberColumn(format="%.2f"),
+                "NSPT":      st.column_config.NumberColumn(min_value=0, max_value=200),
+                "g1":        st.column_config.NumberColumn(min_value=0, max_value=60),
+                "g2":        st.column_config.NumberColumn(min_value=0, max_value=60),
+                "g3":        st.column_config.NumberColumn(min_value=0, max_value=60),
+                "Origem":    st.column_config.TextColumn(),
+                "Descrição": st.column_config.TextColumn(),
+            },
         )
-    except Exception as e:
-        st.error(f"❌ Erro ao gerar DXF: {e}")
-else:
-    col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        st.markdown("**Arquivo único com todas as sondagens:**")
-        try:
-            dxf_todos = gerar_dxf_multiplas(
-                sondagens, distancias=distancias,
-                espacamento_x=float(espacamento),
-                incluir_hachura=incluir_hachura,
-            )
-            st.download_button(
-                label="📥 Baixar sondagens_palitos.dxf",
-                data=dxf_todos,
-                file_name="sondagens_palitos.dxf",
-                mime="application/dxf",
-                use_container_width=True,
-                type="primary",
-            )
-        except Exception as e:
-            st.error(f"❌ Erro: {e}")
-    with col_b2:
-        st.markdown("**Arquivos individuais:**")
-        for sond in sondagens:
+
+        # Reconstruir sondagem editada
+        metros_ed = []
+        for _, row in df_ed.iterrows():
             try:
-                dxf_bytes = gerar_dxf_sondagem(
-                    sond, distancia=0.0, incluir_hachura=incluir_hachura)
-                st.download_button(
-                    label=f"📥 {sond.nome}.dxf",
-                    data=dxf_bytes,
-                    file_name=f"{sond.nome}.dxf",
-                    mime="application/dxf",
-                    use_container_width=True,
+                metros_ed.append(MetroSPT(
+                    prof_m    = float(row["Prof. (m)"]),
+                    nspt      = int(row["NSPT"]),
+                    golpes_1  = int(row["g1"]),
+                    golpes_2  = int(row["g2"]),
+                    golpes_3  = int(row["g3"]),
+                    origem    = str(row["Origem"] or "").strip().upper(),
+                    descricao = str(row["Descrição"] or "").strip().upper(),
+                ))
+            except Exception:
+                pass
+
+        metros_ed.sort(key=lambda m: m.prof_m)
+        sond_ed = SondagemSPT(
+            nome        = nome_ed,
+            cota_boca   = cota_ed,
+            nivel_dagua = na_ed if na_ed > 0 else None,
+            metros      = metros_ed,
+        )
+        sond_ed._distancia = dist_ed
+        sondagens_editadas.append(sond_ed)
+
+        # Download individual
+        if metros_ed:
+            col_dxf, col_hach = st.columns([3, 1])
+            hachura = col_hach.checkbox("Hachura", value=True, key=f"hach_{idx}")
+            try:
+                dxf_bytes = gerar_dxf_sondagem(sond_ed, dist_ed, hachura)
+                col_dxf.download_button(
+                    f"⬇️ Download {nome_ed}.dxf",
+                    data        = dxf_bytes,
+                    file_name   = f"{nome_ed}.dxf",
+                    mime        = "application/dxf",
+                    key         = f"dl_{idx}",
                 )
             except Exception as e:
-                st.error(f"❌ {sond.nome}: {e}")
+                st.error(f"❌ Erro ao gerar DXF: {e}")
 
-st.markdown("---")
+# ---------------------------------------------------------------------------
+# Export de todos em ZIP
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("📦 Exportar DXF")
+
+col1, col2 = st.columns(2)
+hachura_all = col2.checkbox("Incluir hachura", value=True, key="hach_all")
+
+if col1.button("⬇️ Baixar todos os palitos (.zip)", type="primary"):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for sond_ed in sondagens_editadas:
+            if not sond_ed.metros:
+                continue
+            dist = getattr(sond_ed, '_distancia', 0.0)
+            try:
+                dxf_bytes = gerar_dxf_sondagem(sond_ed, dist, hachura_all)
+                zf.writestr(f"{sond_ed.nome}.dxf", dxf_bytes)
+            except Exception as e:
+                st.error(f"Erro em {sond_ed.nome}: {e}")
+    buf.seek(0)
+    st.download_button(
+        "📥 Clique para baixar o ZIP",
+        data      = buf.read(),
+        file_name = "palitos_sondagem.zip",
+        mime      = "application/zip",
+    )
+
+# ---------------------------------------------------------------------------
+# Rodapé
+# ---------------------------------------------------------------------------
+st.divider()
 st.caption(
-    "Escala 1:100 | "
-    "Layers: SONDAGEM_PALITO · SONDAGEM_NSPT · SONDAGEM_TEXTO · "
-    "SONDAGEM_HACHURA · SONDAGEM_NA · SONDAGEM_LIMITE · SONDAGEM_CABECALHO"
+    "Escala 1:100 | Layers: furoSondagem · BR100 · BR60 · BGEOT-VT · "
+    "Nível Dagua · Impenetravel · BLC"
 )
