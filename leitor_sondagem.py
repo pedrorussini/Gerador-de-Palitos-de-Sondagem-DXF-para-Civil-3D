@@ -7,7 +7,7 @@ Modo 2 (bbox manual): recebe coordenadas de seleção do usuário → extração
 
 import re
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
 
@@ -361,17 +361,6 @@ def extrair_tabela_bbox(pagina, bbox: Tuple[float, float, float, float]) -> List
     return metros_spt
 
 
-def converter_coords_canvas_para_pdf(
-    px: float, py: float,
-    canvas_w: float, canvas_h: float,
-    pdf_w: float, pdf_h: float,
-) -> Tuple[float, float]:
-    """
-    Converte coordenadas de pixel do canvas Streamlit → coordenadas do PDF (pontos).
-    """
-    sx = pdf_w / canvas_w
-    sy = pdf_h / canvas_h
-    return px * sx, py * sy
 
 
 def bbox_canvas_para_pdf(

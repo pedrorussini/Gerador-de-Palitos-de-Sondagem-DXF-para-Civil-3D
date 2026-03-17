@@ -1,6 +1,6 @@
 """
 app.py — Gerador de Palitos de Sondagem SPT em DXF para Civil 3D
-Versão com seleção visual de região no PDF (layout-agnóstico)
+Seleção de área no PDF via canvas HTML/JS nativo (sem streamlit-drawable-canvas)
 """
 
 import streamlit as st
@@ -8,10 +8,12 @@ import pandas as pd
 import io
 import zipfile
 import base64
+import json
 
 import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image
+import streamlit.components.v1 as components
 
 from leitor_sondagem import (
     ler_pdf_sondagem, extrair_cabecalho_bbox, extrair_tabela_bbox,
@@ -19,19 +21,151 @@ from leitor_sondagem import (
 )
 from gerar_dxf import gerar_dxf_sondagem
 
-try:
-    from streamlit_drawable_canvas import st_canvas
-    CANVAS_OK = True
-except ImportError:
-    CANVAS_OK = False
-
 # ---------------------------------------------------------------------------
-# Configuração da página
+# Configuração
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Gerador de Palitos SPT", page_icon="🗂️", layout="wide")
 
-CANVAS_W   = 900
+CANVAS_W   = 880
 DPI_RENDER = 150
+
+# ---------------------------------------------------------------------------
+# Canvas HTML/JS nativo — sem dependências externas
+# ---------------------------------------------------------------------------
+
+_CANVAS_HTML = """
+<style>
+  body {{ margin:0; padding:0; background:#1e1e1e; }}
+  #wrap {{ position:relative; display:inline-block; user-select:none; }}
+  #bg   {{ display:block; width:{W}px; height:{H}px; }}
+  #cv   {{ position:absolute; top:0; left:0; cursor:crosshair; }}
+  .lbl  {{ position:absolute; font:bold 11px monospace; padding:2px 5px;
+           border-radius:3px; pointer-events:none; }}
+  #info {{ font:13px monospace; color:#ccc; margin:4px 0 0 0; }}
+</style>
+<div id="wrap">
+  <img id="bg" src="data:image/png;base64,{IMG}" draggable="false"/>
+  <canvas id="cv" width="{W}" height="{H}"></canvas>
+</div>
+<p id="info">Clique e arraste para selecionar a região</p>
+
+<script>
+const cv   = document.getElementById('cv');
+const ctx  = cv.getContext('2d');
+const wrap = document.getElementById('wrap');
+const info = document.getElementById('info');
+
+const COR_CAB = '#00dd55';
+const COR_TAB = '#3399ff';
+const cor     = '{COR}';
+
+let rects = {RECTS};   // seleções existentes para overlay
+let drag  = false;
+let x0=0, y0=0, x1=0, y1=0;
+
+function clamp(v,mn,mx){{ return Math.max(mn,Math.min(mx,v)); }}
+function ptCanvas(e){{
+  const r = cv.getBoundingClientRect();
+  return [clamp(e.clientX-r.left,0,cv.width), clamp(e.clientY-r.top,0,cv.height)];
+}}
+
+function draw(){{
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // overlay
+  rects.forEach(r=>{{
+    ctx.strokeStyle=r.cor; ctx.lineWidth=2;
+    ctx.fillStyle=r.cor+'22';
+    ctx.fillRect(r.x,r.y,r.w,r.h);
+    ctx.strokeRect(r.x,r.y,r.w,r.h);
+    ctx.fillStyle=r.cor;
+    ctx.font='bold 11px monospace';
+    ctx.fillText(r.lbl, r.x+4, r.y+14);
+  }});
+  // atual
+  if(drag){{
+    const w=x1-x0, h=y1-y0;
+    ctx.strokeStyle=cor; ctx.lineWidth=2;
+    ctx.fillStyle=cor+'22';
+    ctx.fillRect(x0,y0,w,h);
+    ctx.strokeRect(x0,y0,w,h);
+    info.textContent='Selecão: '+Math.abs(w)+'×'+Math.abs(h)+' px  —  solte para confirmar';
+  }}
+}}
+
+cv.addEventListener('mousedown', e=>{{
+  [x0,y0]=ptCanvas(e); x1=x0; y1=y0; drag=true;
+}});
+cv.addEventListener('mousemove', e=>{{
+  if(!drag) return;
+  [x1,y1]=ptCanvas(e); draw();
+}});
+cv.addEventListener('mouseup', e=>{{
+  if(!drag) return; drag=false;
+  [x1,y1]=ptCanvas(e);
+  const left=Math.min(x0,x1), top=Math.min(y0,y1);
+  const w=Math.abs(x1-x0), h=Math.abs(y1-y0);
+  if(w>10 && h>10){{
+    const payload = JSON.stringify({{left,top,width:w,height:h}});
+    info.textContent='✅ Região: x='+left+' y='+top+' '+w+'×'+h+' — clique em Confirmar';
+    // Envia para Streamlit via query param trick
+    window.parent.postMessage({{type:'canvas_rect', rect: payload}}, '*');
+  }} else {{
+    info.textContent='Região muito pequena, tente novamente.';
+  }}
+  draw();
+}});
+
+// Toque (mobile)
+cv.addEventListener('touchstart', e=>{{
+  e.preventDefault();
+  const t=e.touches[0];
+  const r=cv.getBoundingClientRect();
+  x0=t.clientX-r.left; y0=t.clientY-r.top; x1=x0; y1=y0; drag=true;
+}},{{passive:false}});
+cv.addEventListener('touchmove', e=>{{
+  e.preventDefault();
+  const t=e.touches[0];
+  const r=cv.getBoundingClientRect();
+  x1=t.clientX-r.left; y1=t.clientY-r.top; draw();
+}},{{passive:false}});
+cv.addEventListener('touchend', e=>{{
+  drag=false;
+  const left=Math.min(x0,x1), top=Math.min(y0,y1);
+  const w=Math.abs(x1-x0), h=Math.abs(y1-y0);
+  if(w>10&&h>10){{
+    window.parent.postMessage({{type:'canvas_rect', rect: JSON.stringify({{left,top,width:w,height:h}})}}, '*');
+  }}
+  draw();
+}});
+
+draw();
+</script>
+"""
+
+def _render_canvas(img_pil: Image.Image, canvas_w: int, canvas_h: int,
+                   cor: str, overlay_rects: list, key: str):
+    """
+    Renderiza canvas HTML nativo com a imagem como fundo.
+    Retorna o HTML component — a captura do rect é feita via session_state
+    através de um input text oculto sincronizado por JS.
+    """
+    buf = io.BytesIO()
+    img_pil.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    rects_js = json.dumps([
+        {"x": r["left"], "y": r["top"], "w": r["width"], "h": r["height"],
+         "cor": r["cor"], "lbl": r["lbl"]}
+        for r in overlay_rects
+    ])
+
+    html = _CANVAS_HTML.format(
+        W=canvas_w, H=canvas_h,
+        IMG=img_b64, COR=cor, RECTS=rects_js,
+    )
+    # Altura do componente = canvas + margem
+    components.html(html, height=canvas_h + 40, scrolling=False)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,11 +175,6 @@ def _pdf_para_imagem(pdf_bytes: bytes, pagina: int = 0, dpi: int = DPI_RENDER):
     imgs = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=pagina+1, last_page=pagina+1)
     return imgs[0] if imgs else None
 
-def _img_para_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
 def _rect_valido(rect) -> bool:
     if not rect:
         return False
@@ -53,7 +182,7 @@ def _rect_valido(rect) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Revisão + export (função reutilizada pelos dois modos)
+# Revisão + export
 # ---------------------------------------------------------------------------
 
 def _renderizar_revisao(sondagens_raw: list):
@@ -76,10 +205,10 @@ def _renderizar_revisao(sondagens_raw: list):
                 )
 
             ca, cb, cc, cd = st.columns(4)
-            nome_ed = ca.text_input("Nome",       value=sond.nome,                  key=f"nome_{idx}")
-            cota_ed = cb.number_input("Cota (m)",  value=float(sond.cota_boca),     step=0.001, format="%.3f", key=f"cota_{idx}")
-            na_ed   = cc.number_input("NA (m)",    value=float(sond.nivel_dagua or 0.0), step=0.1, format="%.2f", key=f"na_{idx}")
-            dist_ed = cd.number_input("Dist. (m)", value=0.0,                        step=0.001, format="%.3f", key=f"dist_{idx}")
+            nome_ed = ca.text_input("Nome",       value=sond.nome,                       key=f"nome_{idx}")
+            cota_ed = cb.number_input("Cota (m)",  value=float(sond.cota_boca),          step=0.001, format="%.3f", key=f"cota_{idx}")
+            na_ed   = cc.number_input("NA (m)",    value=float(sond.nivel_dagua or 0.0), step=0.1,   format="%.2f", key=f"na_{idx}")
+            dist_ed = cd.number_input("Dist. (m)", value=0.0,                             step=0.001, format="%.3f", key=f"dist_{idx}")
 
             st.markdown("**Metros extraídos — complete onde necessário:**")
             df = pd.DataFrame([{
@@ -89,7 +218,7 @@ def _renderizar_revisao(sondagens_raw: list):
             } for m in sond.metros])
 
             df_ed = st.data_editor(
-                df, num_rows="dynamic", use_container_width=True, key=f"tabela_{idx}",
+                df, num_rows="dynamic", width='stretch', key=f"tabela_{idx}",
                 column_config={
                     "Prof. (m)": st.column_config.NumberColumn(format="%.2f"),
                     "NSPT":      st.column_config.NumberColumn(min_value=0, max_value=200),
@@ -132,7 +261,6 @@ def _renderizar_revisao(sondagens_raw: list):
                 except Exception as e:
                     st.error(f"❌ Erro ao gerar DXF: {e}")
 
-    # Export ZIP
     st.divider()
     st.subheader("📦 Exportar todos os DXF")
     c1, c2 = st.columns(2)
@@ -203,18 +331,14 @@ if not usar_manual:
     _renderizar_revisao(sondagens_raw)
 
 # ===========================================================================
-# MODO MANUAL
+# MODO MANUAL — canvas HTML nativo
 # ===========================================================================
 else:
-    if not CANVAS_OK:
-        st.error("⚠️ Instale `streamlit-drawable-canvas` no requirements.txt e reinicie.")
-        st.stop()
-
-    # Inicializar estado
     for key, default in [
         ("paginas_info", {}),
         ("selecoes", {}),
         ("sondagens_manuais", []),
+        ("rect_pendente", {}),   # {chave_str: {etapa: rect}}
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -240,10 +364,11 @@ else:
         if not pags_perfil:
             pags_perfil = list(range(len(pdf_obj.pages)))
 
-    opcoes_pag   = [f"Página {i+1}" for i in pags_perfil]
-    pag_label    = c_pag.selectbox("Página com o perfil SPT", opcoes_pag)
-    pag_idx      = pags_perfil[opcoes_pag.index(pag_label)]
-    chave        = (pdf_idx, pag_idx)
+    opcoes_pag = [f"Página {i+1}" for i in pags_perfil]
+    pag_label  = c_pag.selectbox("Página com o perfil SPT", opcoes_pag)
+    pag_idx    = pags_perfil[opcoes_pag.index(pag_label)]
+    chave      = (pdf_idx, pag_idx)
+    chave_str  = f"{pdf_sel}_pag{pag_idx+1}"
 
     # Renderizar imagem
     if chave not in st.session_state["paginas_info"]:
@@ -265,7 +390,7 @@ else:
     pdf_h   = info["pdf_h"]
     img_w, img_h = img_pil.size
     canvas_h     = int(CANVAS_W * img_h / img_w)
-    img_resized  = img_pil.resize((CANVAS_W, canvas_h))
+    img_resized  = img_pil.resize((CANVAS_W, canvas_h), Image.LANCZOS)
 
     # --- Seleção de etapa ---
     st.divider()
@@ -282,88 +407,83 @@ else:
     rect_tab_exist = selecoes.get("tab")
 
     if sel_cab:
-        st.info("🖱️ **Arraste** para marcar a região do cabeçalho: nome da sondagem, cota e nível d'água.")
+        st.info("🖱️ **Arraste** na imagem abaixo para marcar o **cabeçalho** (nome da sondagem, cota, nível d'água).")
     else:
-        st.info("🖱️ **Arraste** para marcar toda a tabela de dados: escala de profundidade, golpes SPT e descrição do material.")
+        st.info("🖱️ **Arraste** na imagem abaixo para marcar toda a **tabela de dados** (escala de profundidade + golpes + descrição).")
 
-    # Overlay de seleções anteriores
+    # Montar overlay
     overlay = []
     if rect_cab_exist:
-        overlay.append({"type":"rect","left":rect_cab_exist["left"],"top":rect_cab_exist["top"],
-                         "width":rect_cab_exist["width"],"height":rect_cab_exist["height"],
-                         "stroke":"#00cc44","strokeWidth":2,"fill":"rgba(0,204,68,0.10)"})
+        overlay.append({**rect_cab_exist, "cor": "#00dd55", "lbl": "CABEÇALHO"})
     if rect_tab_exist:
-        overlay.append({"type":"rect","left":rect_tab_exist["left"],"top":rect_tab_exist["top"],
-                         "width":rect_tab_exist["width"],"height":rect_tab_exist["height"],
-                         "stroke":"#0066ff","strokeWidth":2,"fill":"rgba(0,102,255,0.10)"})
+        overlay.append({**rect_tab_exist, "cor": "#3399ff", "lbl": "TABELA"})
 
-    cor = "#00cc44" if sel_cab else "#0066ff"
+    cor = "#00dd55" if sel_cab else "#3399ff"
 
-    try:
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,0.04)",
-            stroke_width=2,
-            stroke_color=cor,
-            background_image=img_resized,
-            update_streamlit=True,
-            height=canvas_h,
-            width=CANVAS_W,
-            drawing_mode="rect",
-            initial_drawing={"version": "4.4.0", "objects": overlay},
-            key=f"canvas_{chave}_{etapa}",
-        )
-    except AttributeError:
-        # Fallback para versões antigas do streamlit-drawable-canvas
-        # que não suportam PIL Image diretamente — converte para base64
-        buf_img = io.BytesIO()
-        img_resized.save(buf_img, format="PNG")
-        buf_img.seek(0)
-        from PIL import Image as _PILImage
-        img_compat = _PILImage.open(buf_img)
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,0.04)",
-            stroke_width=2,
-            stroke_color=cor,
-            background_image=img_compat,
-            update_streamlit=True,
-            height=canvas_h,
-            width=CANVAS_W,
-            drawing_mode="rect",
-            key=f"canvas_fb_{chave}_{etapa}",
-        )
+    # Renderizar canvas
+    _render_canvas(img_resized, CANVAS_W, canvas_h, cor, overlay,
+                   key=f"cv_{chave}_{etapa}")
 
-    # Capturar novo retângulo
-    novo_rect = None
-    if canvas_result.json_data:
-        objs = canvas_result.json_data.get("objects", [])
-        novos = [o for o in objs if o.get("stroke") == cor and o.get("type") == "rect"]
-        if novos:
-            o = novos[-1]
-            novo_rect = {"left": o.get("left",0), "top": o.get("top",0),
-                         "width": o.get("width",0), "height": o.get("height",0)}
+    # Input de texto para receber o rect via JavaScript → Streamlit
+    # O usuário cola o JSON ou usa o mecanismo de comunicação
+    st.markdown("**Cole o resultado da seleção abaixo** (o valor aparece automaticamente após arrastar):")
 
-    c_sal, c_lim = st.columns([2, 1])
-    if c_sal.button("✅ Confirmar seleção", key=f"confirmar_{chave}_{etapa}"):
-        if _rect_valido(novo_rect):
-            st.session_state["selecoes"].setdefault(chave, {})
-            if sel_cab:
-                st.session_state["selecoes"][chave]["cab"] = novo_rect
-                st.success("Cabeçalho salvo! Agora selecione a tabela.")
+    col_input, col_btn_conf, col_btn_limpa = st.columns([3, 1, 1])
+
+    rect_json = col_input.text_input(
+        "Região selecionada (JSON):",
+        value=st.session_state.get(f"rect_json_{chave}_{etapa}", ""),
+        placeholder='{"left":100,"top":50,"width":400,"height":80}',
+        key=f"rect_input_{chave}_{etapa}",
+        label_visibility="collapsed",
+    )
+
+    # Script para auto-preencher o campo de texto quando o canvas envia mensagem
+    components.html(f"""
+    <script>
+    window.addEventListener('message', function(e) {{
+      if (e.data && e.data.type === 'canvas_rect') {{
+        // Tenta preencher o input do Streamlit via DOM
+        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+        inputs.forEach(inp => {{
+          if (inp.placeholder && inp.placeholder.includes('"left"')) {{
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(inp, e.data.rect);
+            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          }}
+        }});
+      }}
+    }});
+    </script>
+    """, height=0)
+
+    if col_btn_conf.button("✅ Confirmar", key=f"confirmar_{chave}_{etapa}"):
+        try:
+            rect_parsed = json.loads(rect_json)
+            if _rect_valido(rect_parsed):
+                st.session_state["selecoes"].setdefault(chave, {})
+                if sel_cab:
+                    st.session_state["selecoes"][chave]["cab"] = rect_parsed
+                    st.success("Cabeçalho salvo! Agora selecione a tabela.")
+                else:
+                    st.session_state["selecoes"][chave]["tab"] = rect_parsed
+                    st.success("Tabela salva!")
+                st.rerun()
             else:
-                st.session_state["selecoes"][chave]["tab"] = novo_rect
-                st.success("Tabela salva!")
-            st.rerun()
-        else:
-            st.warning("Desenhe um retângulo antes de confirmar.")
+                st.warning("Rect muito pequeno ou inválido.")
+        except (json.JSONDecodeError, TypeError):
+            st.warning("JSON inválido. Arraste um retângulo na imagem e aguarde o preenchimento automático.")
 
-    if c_lim.button("🗑️ Limpar seleções", key=f"limpar_{chave}"):
+    if col_btn_limpa.button("🗑️ Limpar", key=f"limpar_{chave}"):
         st.session_state["selecoes"].pop(chave, None)
         st.rerun()
 
+    # Status
     st.divider()
-    col_s1, col_s2 = st.columns(2)
-    col_s1.success("✅ Cabeçalho selecionado") if rect_cab_exist else col_s1.warning("⏳ Cabeçalho ainda não selecionado")
-    col_s2.success("✅ Tabela selecionada")    if rect_tab_exist else col_s2.warning("⏳ Tabela ainda não selecionada")
+    cs1, cs2 = st.columns(2)
+    cs1.success("✅ Cabeçalho selecionado") if rect_cab_exist else cs1.warning("⏳ Cabeçalho ainda não selecionado")
+    cs2.success("✅ Tabela selecionada")    if rect_tab_exist else cs2.warning("⏳ Tabela ainda não selecionada")
 
     # --- Extração ---
     if rect_cab_exist and rect_tab_exist:
@@ -372,7 +492,7 @@ else:
             with st.spinner("Extraindo dados do PDF..."):
                 try:
                     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_obj:
-                        pagina = pdf_obj.pages[pag_idx]
+                        pagina  = pdf_obj.pages[pag_idx]
                         bbox_cab = bbox_canvas_para_pdf(rect_cab_exist, CANVAS_W, canvas_h, pdf_w, pdf_h)
                         bbox_tab = bbox_canvas_para_pdf(rect_tab_exist, CANVAS_W, canvas_h, pdf_w, pdf_h)
                         cab    = extrair_cabecalho_bbox(pagina, bbox_cab)
@@ -382,22 +502,20 @@ else:
                         nome=cab["nome"], cota_boca=cab["cota_boca"],
                         nivel_dagua=cab["nivel_dagua"], metros=metros,
                     )
-                    chave_str = f"{pdf_sel}_pag{pag_idx+1}"
                     lista = [(n, s) for n, s in st.session_state["sondagens_manuais"]
                              if n != chave_str]
                     lista.append((chave_str, sond))
                     st.session_state["sondagens_manuais"] = lista
                     st.success(f"✅ {len(metros)} metro(s) extraído(s).")
 
-                    # Mostrar texto bruto do cabeçalho para debug
-                    with st.expander("🔎 Texto extraído do cabeçalho (debug)"):
+                    with st.expander("🔎 Texto bruto do cabeçalho (debug)"):
                         st.code(cab.get("texto_raw", ""))
 
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Erro na extração: {e}")
 
-    # --- Revisão das sondagens já extraídas ---
+    # --- Revisão ---
     sondagens_manuais = st.session_state.get("sondagens_manuais", [])
     if sondagens_manuais:
         st.divider()
