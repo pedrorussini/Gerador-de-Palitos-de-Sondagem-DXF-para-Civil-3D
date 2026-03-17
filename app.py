@@ -299,16 +299,38 @@ else:
 
     cor = "#00cc44" if sel_cab else "#0066ff"
 
-    canvas_result = st_canvas(
-        fill_color="rgba(0,0,0,0.04)",
-        stroke_width=2, stroke_color=cor,
-        background_image=img_resized,
-        update_streamlit=True,
-        height=canvas_h, width=CANVAS_W,
-        drawing_mode="rect",
-        initial_drawing={"version":"4.4.0","objects":overlay},
-        key=f"canvas_{chave}_{etapa}",
-    )
+    try:
+        canvas_result = st_canvas(
+            fill_color="rgba(0,0,0,0.04)",
+            stroke_width=2,
+            stroke_color=cor,
+            background_image=img_resized,
+            update_streamlit=True,
+            height=canvas_h,
+            width=CANVAS_W,
+            drawing_mode="rect",
+            initial_drawing={"version": "4.4.0", "objects": overlay},
+            key=f"canvas_{chave}_{etapa}",
+        )
+    except AttributeError:
+        # Fallback para versões antigas do streamlit-drawable-canvas
+        # que não suportam PIL Image diretamente — converte para base64
+        buf_img = io.BytesIO()
+        img_resized.save(buf_img, format="PNG")
+        buf_img.seek(0)
+        from PIL import Image as _PILImage
+        img_compat = _PILImage.open(buf_img)
+        canvas_result = st_canvas(
+            fill_color="rgba(0,0,0,0.04)",
+            stroke_width=2,
+            stroke_color=cor,
+            background_image=img_compat,
+            update_streamlit=True,
+            height=canvas_h,
+            width=CANVAS_W,
+            drawing_mode="rect",
+            key=f"canvas_fb_{chave}_{etapa}",
+        )
 
     # Capturar novo retângulo
     novo_rect = None
