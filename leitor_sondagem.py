@@ -1,18 +1,14 @@
 """
-leitor_sondagem.py — Lê boletins SPT em PDF e retorna dados estruturados.
+leitor_sondagem.py — Extração de dados SPT de PDFs de sondagem.
 
-Suporta:
-  - Geoloc Engenharia e Geologia (parser bbox dedicado)
-  - New Solos Engenharia (mesmo layout Geoloc)
-  - Souli Geotecnia (parser bbox esquerda)
-  - Suporte / Sondagem Mista SM (parser texto)
-  - Layouts desconhecidos (tenta todos e usa o melhor)
+Modo 1 (automático): parsers por empresa (Geoloc, New Solos, Souli, Suporte SM)
+Modo 2 (bbox manual): recebe coordenadas de seleção do usuário → extração precisa
 """
 
 import re
 import io
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +39,7 @@ class SondagemSPT:
 
 
 # ---------------------------------------------------------------------------
-# Utilitários
+# Utilitários compartilhados
 # ---------------------------------------------------------------------------
 
 _ORIGENS = {"SS","SRM","SRJ","SR","AT","AL","DFL","SAR","RC","SP","SDL","SM","SO","SRS"}
@@ -56,62 +52,352 @@ _KW_SOLO = [
 def _tem_solo(s: str) -> bool:
     return any(kw in s.lower() for kw in _KW_SOLO)
 
-def _limpar_desc(s: str) -> str:
-    """Remove prefixos numéricos, extrai origem e retorna descrição em MAIÚSCULAS."""
-    s = s.strip()
-    s = re.sub(r'^[\d/\s]+(?=[A-ZÁÉÍÓÚ])', '', s)
-    s = re.sub(r'^\d{1,2}[,.]\d{2}\s+', '', s)
-    s = re.sub(r'^PM\d.*?(?=[A-ZÁÉÍÓÚ])', '', s)
-    s = re.sub(r'\s+\d{1,2}\s*$', '', s)
-    s = re.sub(r'\s+\d{2}\s+(?=[A-ZÁÉÍÓÚ])', ' ', s)
-    # Remove letras isoladas de grau de consistência SM
-    s = re.sub(r'\b[A-Z]{1,2}\b\s+[A-Z]{1,2}\b(\s+[A-Z]{1,2}\b)*', '', s)
-    # Remove sufixos de penetração parcial
-    s = re.sub(r'\s+\d+/\d+\s*$', '', s)
-    tokens = s.split()
-    tokens_limpos = [t for t in tokens if t.upper() not in _ORIGENS]
-    s = " ".join(tokens_limpos).strip().rstrip(',.')
-    return s.upper() if s else ""
-
-def _extrair_origem_inline(s: str) -> tuple:
-    """Extrai sigla de origem embutida no texto. Retorna (texto_sem_origem, origem)."""
-    tokens = s.split()
-    orig = ""
-    resto = []
-    for t in tokens:
-        if t.upper() in _ORIGENS:
-            orig = t.upper()
-        else:
-            resto.append(t)
-    return " ".join(resto), orig
-
 def _num(s: str) -> Optional[float]:
     try:
-        return float(s.replace(',', '.'))
+        return float(str(s).replace(',', '.').strip())
     except Exception:
         return None
 
 def _extrair_cota(texto: str) -> Optional[float]:
-    m = re.search(r"[Cc]ota\s+da\s+boca\s+do\s+furo[:\s]+([0-9]+[,.]?[0-9]*)", texto)
+    m = re.search(r"[Cc]ota\s+da\s+boca\s+do\s+furo[:\s]+([0-9.,]+)", texto)
+    if m:
+        return _num(m.group(1))
+    m = re.search(r"[Cc]ota\s*[:\s]+([0-9.,]+)\s*m", texto)
     return _num(m.group(1)) if m else None
 
 def _extrair_nivel(texto: str) -> Optional[float]:
-    m = re.search(r"[Nn][íi]vel\s+d['\u2019]?\s*[áa]gua[:\s]+([0-9]+[,.]?[0-9]*)", texto)
+    if re.search(r"[Aa]usente|nao\s+observado|n\.?\s*o\.", texto, re.IGNORECASE):
+        return None
+    m = re.search(r"[Nn][íi]vel\s+d['\u2019]?\s*[áa]gua[:\s]+([0-9.,]+)", texto)
     return _num(m.group(1)) if m else None
 
 def _extrair_nome(texto: str, idx: int) -> str:
     for pat in [
         r'\b(S[MP]-[0-9A-Z]+-[0-9]+-[0-9]+[A-Z0-9]*)\b',
         r'\b(S[MP]-[0-9A-Z]+-[0-9]+)\b',
+        r'\b(PM-?\d+[A-Z]?)\b',
     ]:
         m = re.search(pat, texto)
         if m:
             return m.group(1)
-    return f"Sondagem-p{idx+1}"
+    return f"Sondagem-{idx+1}"
+
+def _limpar_desc(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r'^[\d/\s]+(?=[A-ZÁÉÍÓÚ])', '', s)
+    s = re.sub(r'^\d{1,2}[,.]\d{2}\s+', '', s)
+    s = re.sub(r'\s+\d{1,2}\s*$', '', s)
+    s = re.sub(r'\s+\d+/\d+\s*$', '', s)
+    tokens = s.split()
+    tokens_limpos = [t for t in tokens if t.upper() not in _ORIGENS]
+    s = " ".join(tokens_limpos).strip().rstrip(',.')
+    return s.upper() if s else ""
+
 
 # ---------------------------------------------------------------------------
-# Parser linha a linha (genérico)
+# MODO 2: Extração por bbox selecionado pelo usuário
 # ---------------------------------------------------------------------------
+
+def extrair_cabecalho_bbox(pagina, bbox: Tuple[float, float, float, float]) -> dict:
+    """
+    Extrai nome, cota_boca e nivel_dagua de uma região selecionada pelo usuário.
+    bbox = (x0, top, x1, bottom) em coordenadas do PDF (pontos).
+    Retorna dict com chaves: nome, cota_boca, nivel_dagua
+    """
+    x0, top, x1, bottom = bbox
+    crop = pagina.crop((x0, top, x1, bottom))
+    texto = crop.extract_text() or ""
+
+    nome = _extrair_nome(texto, 0)
+    cota = _extrair_cota(texto) or 0.0
+    nivel = _extrair_nivel(texto)
+
+    return {
+        "nome":        nome,
+        "cota_boca":   cota,
+        "nivel_dagua": nivel,
+        "texto_raw":   texto,  # para debug/revisão
+    }
+
+
+def extrair_tabela_bbox(pagina, bbox: Tuple[float, float, float, float]) -> List[MetroSPT]:
+    """
+    Extrai metros SPT de uma região selecionada pelo usuário.
+    bbox = (x0, top, x1, bottom) em coordenadas do PDF.
+
+    Estratégia layout-agnóstica:
+    1. Extrai todas as palavras com posição x/y dentro do bbox
+    2. Detecta a coluna de escala vertical (números sequenciais 1..N)
+    3. Detecta colunas de golpes (números 0-60 fora da escala e descrição)
+    4. Detecta coluna de descrição (texto com palavras geotécnicas)
+    5. Agrupa tudo por metro e monta MetroSPT
+    """
+    import pdfplumber
+    from collections import Counter
+
+    x0_bbox, top_bbox, x1_bbox, bot_bbox = bbox
+    crop = pagina.crop((x0_bbox, top_bbox, x1_bbox, bot_bbox))
+    words = crop.extract_words(use_text_flow=False, keep_blank_chars=False)
+
+    if not words:
+        return []
+
+    W = x1_bbox - x0_bbox
+    H = bot_bbox - top_bbox
+
+    # --- Detectar escala vertical (números 1..N sequenciais) ---
+    num_words = [w for w in words
+                 if re.match(r"^\d{1,2}$", w["text"])
+                 and 1 <= int(w["text"]) <= 30]
+
+    if not num_words:
+        return []
+
+    # Agrupar candidatos por faixa de x → coluna mais frequente
+    x_freq = Counter(round(w["x0"] / 5) * 5 for w in num_words)
+    x_escala_approx = x_freq.most_common(1)[0][0]
+
+    escala_words = [w for w in num_words
+                    if abs(w["x0"] - x_escala_approx) < W * 0.06]
+
+    # Validar sequência (pelo menos 3 números consecutivos ou próximos)
+    ns = sorted(set(int(w["text"]) for w in escala_words))
+    if len(ns) < 2:
+        return []
+
+    # Montar metro_y: número → y_centro
+    metro_y = {}
+    for w in escala_words:
+        n = int(w["text"])
+        y = (w["top"] + w["bottom"]) / 2
+        if n not in metro_y:
+            metro_y[n] = y
+
+    metros_lista = sorted(metro_y.keys())
+
+    # Altura de um metro em pixels do crop
+    alts = [abs(metro_y[metros_lista[i]] - metro_y[metros_lista[i-1]])
+            for i in range(1, len(metros_lista))]
+    altura_metro = sum(alts) / len(alts) if alts else H / max(len(metros_lista), 1)
+
+    # --- Detectar limite da sondagem ---
+    limite_words = [w for w in words
+                    if any(k in w["text"].upper() for k in ["LIMITE", "IMPENET"])]
+    y_limite = min((w["top"] for w in limite_words), default=H * 0.95)
+    metro_y = {n: y for n, y in metro_y.items() if y <= y_limite + altura_metro}
+    metros_lista = sorted(metro_y.keys())
+    if not metros_lista:
+        return []
+
+    # --- Separar região de golpes da região de descrição ---
+    # Palavras-solo indicam onde está a coluna de descrição
+    kw_up = [k.upper() for k in _KW_SOLO]
+    solo_words = [w for w in words
+                  if any(k in w["text"].upper() for k in kw_up)]
+
+    if solo_words:
+        x_desc_inicio = min(w["x0"] for w in solo_words) - 5
+    else:
+        # Sem palavras-solo: assumir metade direita como descrição
+        x_desc_inicio = W * 0.45
+
+    # Golpes: inteiros 0–60, fora da escala e fora da descrição
+    golpe_words = [w for w in words
+                   if re.match(r"^\d{1,2}$", w["text"])
+                   and 0 <= int(w["text"]) <= 60
+                   and w["top"] <= y_limite + 10
+                   and abs(w["x0"] - x_escala_approx) > W * 0.04
+                   and w["x0"] < x_desc_inicio - 5]
+
+    # Palavras de descrição: à direita de x_desc_inicio, abaixo do cabeçalho
+    desc_words = [w for w in words
+                  if w["x0"] >= x_desc_inicio - 10
+                  and w["top"] <= y_limite + altura_metro
+                  and len(w["text"]) > 1
+                  and not re.match(r"^[\d,./:><=+\-]+$", w["text"])]
+
+    # Palavras de origem (siglas): qualquer x
+    orig_words = [w for w in words
+                  if w["text"].upper() in _ORIGENS
+                  and w["top"] <= y_limite + altura_metro]
+
+    # --- Função: a qual metro pertence uma coordenada y? ---
+    def _metro_de_y(y_pt):
+        for i, n in enumerate(metros_lista):
+            if n == 0:
+                continue
+            n_prev = metros_lista[i - 1]
+            y_base = metro_y[n]
+            y_topo = metro_y.get(n_prev, y_base - altura_metro)
+            margem = altura_metro * 0.55
+            if y_topo - margem <= y_pt <= y_base + margem:
+                return n
+        return None
+
+    # --- Agrupar golpes por metro ---
+    golpes_por_metro = {}
+    for w in golpe_words:
+        yc = (w["top"] + w["bottom"]) / 2
+        n = _metro_de_y(yc)
+        if n is not None:
+            golpes_por_metro.setdefault(n, []).append(int(w["text"]))
+
+    # --- Agrupar linhas de descrição ---
+    desc_lines = []
+    if desc_words:
+        dw_sorted = sorted(desc_words, key=lambda w: w["top"])
+        grupo = [dw_sorted[0]]
+        for w in dw_sorted[1:]:
+            if abs(w["top"] - grupo[-1]["top"]) < altura_metro * 0.4:
+                grupo.append(w)
+            else:
+                desc_lines.append(grupo)
+                grupo = [w]
+        desc_lines.append(grupo)
+
+    # Construir blocos de descrição com range de y
+    blocos_desc = []
+    if desc_lines:
+        bloco_atual = [desc_lines[0]]
+        for ln in desc_lines[1:]:
+            y_gap = ln[0]["top"] - bloco_atual[-1][0]["top"]
+            if y_gap < altura_metro * 1.6:
+                bloco_atual.append(ln)
+            else:
+                y0 = bloco_atual[0][0]["top"]
+                y1 = bloco_atual[-1][0]["bottom"]
+                texto_bloco = " ".join(
+                    " ".join(w["text"] for w in sorted(ln2, key=lambda w: w["x0"]))
+                    for ln2 in bloco_atual
+                )
+                desc_limpa = _limpar_desc(texto_bloco)
+                orig_bloco = ""
+                for ow in orig_words:
+                    if y0 - altura_metro * 0.5 <= ow["top"] <= y1 + altura_metro * 0.5:
+                        orig_bloco = ow["text"].upper()
+                        break
+                if desc_limpa and _tem_solo(desc_limpa):
+                    blocos_desc.append((y0, y1, desc_limpa, orig_bloco))
+                bloco_atual = [ln]
+
+        # Último bloco
+        if bloco_atual:
+            y0 = bloco_atual[0][0]["top"]
+            y1 = bloco_atual[-1][0]["bottom"]
+            texto_bloco = " ".join(
+                " ".join(w["text"] for w in sorted(ln2, key=lambda w: w["x0"]))
+                for ln2 in bloco_atual
+            )
+            desc_limpa = _limpar_desc(texto_bloco)
+            orig_bloco = ""
+            for ow in orig_words:
+                if y0 - altura_metro * 0.5 <= ow["top"] <= y1 + altura_metro * 0.5:
+                    orig_bloco = ow["text"].upper()
+                    break
+            if desc_limpa and _tem_solo(desc_limpa):
+                blocos_desc.append((y0, y1, desc_limpa, orig_bloco))
+
+    # --- Associar blocos de descrição → metros ---
+    desc_por_metro = {}
+    orig_por_metro = {}
+    y_max = max(metro_y.values())
+
+    for j, (y_ini, y_fim, texto, orig) in enumerate(blocos_desc):
+        y_prox = blocos_desc[j + 1][0] if j + 1 < len(blocos_desc) else y_max + altura_metro
+        for n in metros_lista:
+            if n == 0:
+                continue
+            idx_n = metros_lista.index(n)
+            n_prev = metros_lista[idx_n - 1]
+            y_prev = metro_y.get(n_prev, metro_y[n] - altura_metro)
+            yc = (y_prev + metro_y[n]) / 2
+            if y_ini - altura_metro * 0.35 <= yc < y_prox and n not in desc_por_metro:
+                desc_por_metro[n] = texto
+                orig_por_metro[n] = orig
+
+    # Preencher vazios com último valor
+    ult_desc = ""
+    ult_orig = ""
+    for n in metros_lista:
+        if n == 0:
+            continue
+        if n in desc_por_metro:
+            ult_desc = desc_por_metro[n]
+            ult_orig = orig_por_metro.get(n, "")
+        else:
+            desc_por_metro[n] = ult_desc
+            orig_por_metro[n] = ult_orig
+
+    # --- Montar MetroSPT ---
+    metros_spt = []
+    for n in metros_lista:
+        if n == 0:
+            continue
+        gs = sorted(golpes_por_metro.get(n, []))
+        gs_validos = [g for g in gs if g != 15]
+
+        if len(gs_validos) >= 3:
+            g1, g2, g3 = gs_validos[0], gs_validos[1], gs_validos[2]
+        elif len(gs_validos) == 2:
+            g1, g2, g3 = 0, gs_validos[0], gs_validos[1]
+        elif len(gs) >= 3:
+            g1, g2, g3 = gs[0], gs[1], gs[2]
+        elif len(gs) == 2:
+            g1, g2, g3 = 0, gs[0], gs[1]
+        else:
+            # Metro sem golpes detectados — adiciona com NSPT=0 para não perder a profundidade
+            g1, g2, g3 = 0, 0, 0
+
+        metros_spt.append(MetroSPT(
+            prof_m=float(n),
+            nspt=g2 + g3,
+            golpes_1=g1,
+            golpes_2=g2,
+            golpes_3=g3,
+            descricao=desc_por_metro.get(n, ""),
+            origem=orig_por_metro.get(n, ""),
+        ))
+
+    return metros_spt
+
+
+def converter_coords_canvas_para_pdf(
+    px: float, py: float,
+    canvas_w: float, canvas_h: float,
+    pdf_w: float, pdf_h: float,
+) -> Tuple[float, float]:
+    """
+    Converte coordenadas de pixel do canvas Streamlit → coordenadas do PDF (pontos).
+    """
+    sx = pdf_w / canvas_w
+    sy = pdf_h / canvas_h
+    return px * sx, py * sy
+
+
+def bbox_canvas_para_pdf(
+    rect: dict,
+    canvas_w: float, canvas_h: float,
+    pdf_w: float, pdf_h: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Converte um rect do streamlit-drawable-canvas → bbox PDF (x0, top, x1, bottom).
+    rect tem chaves: left, top, width, height (em pixels do canvas).
+    """
+    sx = pdf_w / canvas_w
+    sy = pdf_h / canvas_h
+    x0 = rect["left"] * sx
+    y0 = rect["top"] * sy
+    x1 = (rect["left"] + rect["width"]) * sx
+    y1 = (rect["top"] + rect["height"]) * sy
+    return x0, y0, x1, y1
+
+
+# ---------------------------------------------------------------------------
+# MODO 1: Parsers automáticos (mantidos para fallback/compatibilidade)
+# ---------------------------------------------------------------------------
+
+def _extrair_cota_auto(texto): return _extrair_cota(texto)
+def _extrair_nivel_auto(texto): return _extrair_nivel(texto)
 
 _RE_GOLPES = re.compile(
     r'^(\d{1,2})\s+(\d{1,4})\s+(\d{1,4})'
@@ -119,13 +405,16 @@ _RE_GOLPES = re.compile(
     r'(?:\s+(\d{1,4}))?'
     r'(?:\s+(.*))?$'
 )
-_RE_PROF = re.compile(r'^(\d{1,2}[,.]\d{1,2})$')
-_RE_INT_ISOLADO = re.compile(r'^\d{1,2}$')
+_RE_PROF  = re.compile(r'^(\d{1,2}[,.]\d{1,2})$')
+_RE_INT_I = re.compile(r'^\d{1,2}$')
 
-def _descompactar(s: str) -> tuple:
+
+def _descompactar(s: str):
     v = _num(s)
-    if v is None: return None, None
-    if v <= 60: return int(v), None
+    if v is None:
+        return None, None
+    if v <= 60:
+        return int(v), None
     for split in [1, 2]:
         a, b = int(s[:split]), int(s[split:])
         if 0 <= a <= 60 and 0 <= b <= 60:
@@ -133,7 +422,7 @@ def _descompactar(s: str) -> tuple:
     return int(v), None
 
 
-def _parse_pagina(texto: str) -> tuple:
+def _parse_pagina(texto: str):
     metros = []
     blocos = []
     prof_metro = 1.0
@@ -154,62 +443,35 @@ def _parse_pagina(texto: str) -> tuple:
         orig_atual = ""
         prof_bloco_ini = prof_fim
 
-    linhas = texto.split("\n")
-    i = 0
-    while i < len(linhas):
-        linha = linhas[i].strip()
-        i += 1
+    _IGNORAR_LINHAS = [
+        "NEW SOLOS","GEOLOC","SUPORTE","SOULI","END:","Cliente:","Obra:",
+        "Local:","Resp.","CREA","ENGENHEIRO","Escala","Revestimento:","Sistema:",
+        "SPT Golpes","1ª 2ª 3ª","1ª + 2ª","Nº de Golpes","Resistência à Penetração",
+        "Classificação do Material","Origem: SRJ","Origem: AT","Origem: SS",
+        "CONFORME","NBR 6484","Sondagem de Reconhecimento","PERFIL INDIVIDUAL",
+        "Norte:","Este:","Fuso:","Coordenadas","Datum:","Perfuração:",
+        "Altura de queda","Peso:","Amostrador","Nível d",
+    ]
+
+    for linha in texto.split("\n"):
+        linha = linha.strip()
         if not linha:
             continue
-
-        if any(ign in linha for ign in [
-            "NEW SOLOS", "GEOLOC", "SUPORTE", "SOULI",
-            "END:", "Cliente:", "Obra:", "Local:", "Resp.", "CREA",
-            "ENGENHEIRO", "Escala", "Revestimento:", "Sistema:",
-            "SPT Golpes", "1ª 2ª 3ª", "1ª + 2ª", "Nº de Golpes",
-            "Resistência à Penetração", "Classificação do Material",
-            "Origem: SRJ", "Origem: AT", "Origem: SS", "Origem: AL",
-            "CONFORME", "NBR 6484",
-            "Sondagem de Reconhecimento", "Sondagem a Percussão",
-            "PERFIL INDIVIDUAL", "Norte:", "Este:", "Fuso:",
-            "Coordenadas", "Datum:", "Perfuração:", "Altura de queda",
-            "Peso:", "Amostrador", "Int.:", "Ext.:", "Nível d",
-            "Rev. /", "Penetração", "atoC", "lifreP", "megirO",
-            "etnesuA", "EMROFNOC", "RBN", ".A.N",
-            "lifreP megirO", "PROFUNDIDADE PROF", "Classificação",
-            "LIFREP", "MEGIRO",
-        ]):
+        if any(ign in linha for ign in _IGNORAR_LINHAS):
             continue
-
-        if _RE_INT_ISOLADO.match(linha) or re.match(r'^0[0-9]$', linha):
-            continue
-        if re.match(r'^00,\d{3}$', linha):
-            continue
-        if len(linha) > 10:
-            espaco_ratio = linha.count(' ') / len(linha)
-            if espaco_ratio > 0.45 and not _tem_solo(linha):
-                continue
-            if espaco_ratio > 0.35 and _tem_solo(linha):
-                match_txt = re.search(r'([A-ZÁÉÍÓÚ][a-záéíóúãõçàâêôü][\w\s,()àáéíóúãõçâêô]*)', linha)
-                if match_txt:
-                    linha = match_txt.group(1).strip()
-                else:
-                    continue
-        if re.match(r'^0 10 20', linha):
+        if _RE_INT_I.match(linha):
             continue
 
         m_prof = _RE_PROF.match(linha)
         if m_prof:
             prof_val = _num(m_prof.group(1))
-            if prof_val is not None and 0 < prof_val <= 30:
+            if prof_val and 0 < prof_val <= 30:
                 _fechar_bloco(prof_val)
             continue
 
         m_g = _RE_GOLPES.match(linha)
         if m_g:
-            g1_raw = m_g.group(1)
-            g2_raw = m_g.group(2)
-            g3_raw = m_g.group(3)
+            g1_raw, g2_raw, g3_raw = m_g.group(1), m_g.group(2), m_g.group(3)
             g1 = int(g1_raw) if _num(g1_raw) and _num(g1_raw) <= 60 else 0
             g2_v, g3_extra = _descompactar(g2_raw)
             if g3_extra is not None:
@@ -222,102 +484,19 @@ def _parse_pagina(texto: str) -> tuple:
                 continue
             if g1 == 15 and g2 == 15 and g3 == 15:
                 continue
-
-            nspt = g2 + g3
-            resto = (m_g.group(5) or "").strip()
-
-            soma2_str = m_g.group(4)
-            if soma2_str and ',' in linha:
-                m_p = re.search(r'\b(\d{1,2}[,.]\d{1,2})\b', linha)
-                if m_p:
-                    prof_val = _num(m_p.group(1))
-                    if prof_val is not None and 0 < prof_val <= 30:
-                        pos = linha.find(m_p.group(1)) + len(m_p.group(1))
-                        desc_pos = linha[pos:].strip()
-                        metros.append(MetroSPT(
-                            prof_m=round(prof_metro, 2),
-                            nspt=nspt, golpes_1=g1, golpes_2=g2, golpes_3=g3,
-                        ))
-                        prof_metro += 1.0
-                        _fechar_bloco(prof_val)
-                        if _tem_solo(desc_pos):
-                            desc_atual = _limpar_desc(desc_pos)
-                        continue
-
-            if resto and _tem_solo(resto):
-                desc_nova = _limpar_desc(resto)
-                if desc_nova:
-                    if desc_atual and desc_nova != desc_atual:
-                        _fechar_bloco(prof_metro - 1.0)
-                    desc_atual = desc_nova
-
             metros.append(MetroSPT(
                 prof_m=round(prof_metro, 2),
-                nspt=nspt, golpes_1=g1, golpes_2=g2, golpes_3=g3,
+                nspt=g2 + g3, golpes_1=g1, golpes_2=g2, golpes_3=g3,
             ))
             prof_metro += 1.0
             continue
 
-        tokens = linha.split()
-        orig_inline = ""
-        if tokens and tokens[-1].upper() in _ORIGENS:
-            orig_inline = tokens[-1].upper()
-            linha_sem_orig = " ".join(tokens[:-1]).strip().rstrip(".")
-        else:
-            linha_sem_orig = linha
-
-        if _tem_solo(linha_sem_orig):
-            m_inline = re.search(r'\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})(?:\s+\d{1,2})?\s*$', linha_sem_orig)
-            if m_inline:
-                g1i = int(m_inline.group(1))
-                g2i = int(m_inline.group(2))
-                g3i = int(m_inline.group(3))
-                if all(0 <= g <= 60 for g in [g1i, g2i, g3i]) and not (g1i==15 and g2i==15 and g3i==15):
-                    desc_inline = _limpar_desc(linha_sem_orig[:m_inline.start()])
-                    if desc_inline and _tem_solo(desc_inline) and desc_inline != desc_atual:
-                        _fechar_bloco(prof_metro - 1.0)
-                        desc_atual = desc_inline
-                        if orig_inline:
-                            orig_atual = orig_inline
-                    nspt_i = g2i + g3i
-                    metros.append(MetroSPT(
-                        prof_m=round(prof_metro, 2),
-                        nspt=nspt_i, golpes_1=g1i, golpes_2=g2i, golpes_3=g3i,
-                    ))
-                    prof_metro += 1.0
-                    continue
-
-            desc_nova = _limpar_desc(linha_sem_orig)
+        if _tem_solo(linha):
+            desc_nova = _limpar_desc(linha)
             if desc_nova:
                 if desc_atual and desc_nova != desc_atual:
                     _fechar_bloco(prof_metro - 1.0)
                 desc_atual = desc_nova
-                if orig_inline:
-                    orig_atual = orig_inline
-            continue
-
-        if desc_atual and not re.match(r'^[\d\s,./]+$', linha):
-            if not _tem_solo(linha) and len(linha) > 3:
-                cont, orig_cont = _extrair_origem_inline(linha.strip())
-                if orig_cont:
-                    orig_atual = orig_cont
-                if cont.strip():
-                    desc_atual = (desc_atual.rstrip(",. ") + " " + cont.strip()).upper()
-            continue
-
-        if len(tokens) == 1 and tokens[0].upper() in _ORIGENS:
-            orig_atual = tokens[0].upper()
-            continue
-
-        if tokens and tokens[0].upper() in _ORIGENS and len(tokens) > 1:
-            orig_atual = tokens[0].upper()
-            resto2 = " ".join(tokens[1:])
-            if _tem_solo(resto2):
-                desc_nova = _limpar_desc(resto2)
-                if desc_nova:
-                    if desc_atual and desc_nova != desc_atual:
-                        _fechar_bloco(prof_metro - 1.0)
-                    desc_atual = desc_nova
             continue
 
     if desc_atual:
@@ -343,26 +522,17 @@ def _associar(metros, blocos):
     return metros
 
 
-# ---------------------------------------------------------------------------
-# Parser bbox Geoloc / New Solos (classificação à DIREITA)
-# ---------------------------------------------------------------------------
-
 def _parse_geoloc_bbox(pagina) -> list:
-    import re as _re
+    """Parser automático para layout Geoloc/New Solos (classificação à direita)."""
     _ORIGENS_LOCAL = {"SRM","SRJ","SS","AT","SR","AL","DFL","SAR","RC","SRR"}
-    _EXCLUIR_TEXTO = {
-        "LIMITE","IMPENET","TRÉPANO","CIRCULAÇÃO","LAVAGEM","PERFURAÇÃO",
-        "CREA","CIVIL","ENGENHEIRO","RESPONSÁVEL","OBS","NBR",
-    }
-
     W = pagina.width; H = pagina.height
     words = pagina.extract_words(use_text_flow=False, keep_blank_chars=False)
 
-    # Escala vertical
+    # Escala vertical (coluna de profundidade)
     escala_words = [w for w in words
                     if W*0.27 < w["x0"] < W*0.34
                     and w["top"] > H*0.22 and w["top"] < H*0.85
-                    and _re.match(r"^\d{1,2}$", w["text"])
+                    and re.match(r"^\d{1,2}$", w["text"])
                     and int(w["text"]) <= 20]
     metro_y = {}
     for w in escala_words:
@@ -374,170 +544,113 @@ def _parse_geoloc_bbox(pagina) -> list:
     if not metro_y:
         return []
 
-    # Limite da sondagem
     limite_words = [w for w in words
                     if w["top"] > H*0.30
                     and any(k in w["text"].upper() for k in ["LIMITE","IMPENET"])
                     and W*0.40 < w["x0"] < W*0.75]
     y_limite = min((w["top"] for w in limite_words), default=H*0.85)
     metro_y = {n: y for n, y in metro_y.items() if y <= y_limite + 30}
-
     if not metro_y:
         return []
 
     metros_lista = sorted(metro_y.keys())
-    alturas = [abs(metro_y[metros_lista[i]] - metro_y[metros_lista[i-1]])
-               for i in range(1, len(metros_lista))]
-    altura_metro = sum(alturas) / len(alturas) if alturas else 28.0
+    alts = [abs(metro_y[metros_lista[i]] - metro_y[metros_lista[i-1]])
+            for i in range(1, len(metros_lista))]
+    altura_metro = sum(alts) / len(alts) if alts else 28.0
 
-    # Golpes — capturar APENAS as colunas 1ª, 2ª, 3ª (x < 18% da largura)
-    # O layout Geoloc/New Solos tem: 1ª(12%) | 2ª(14%) | 3ª(16%) | 1ª+2ª(20%) | 2ª+3ª(24%)
-    # Limitar a x < 18% garante que só pegamos os 3 golpes individuais
-    y_ultimo_metro = max(metro_y.values())
-    golpes_words_ind = [w for w in words
-                        if W*0.04 < w["x0"] < W*0.18
-                        and w["top"] > H*0.22
-                        and w["top"] < y_ultimo_metro + 15
-                        and _re.match(r"^\d{1,2}$", w["text"])
-                        and 0 <= int(w["text"]) <= 60]
+    y_ultimo = max(metro_y.values())
+    golpes_ind = [w for w in words
+                  if W*0.04 < w["x0"] < W*0.18
+                  and w["top"] > H*0.22 and w["top"] < y_ultimo + 15
+                  and re.match(r"^\d{1,2}$", w["text"])
+                  and 0 <= int(w["text"]) <= 60]
 
-    # Colunas de soma: 1ª+2ª (x≈20%) e 2ª+3ª (x≈24%)
-    # Usadas como fallback quando as individuais não estão disponíveis
-    golpes_words_soma = [w for w in words
-                         if W*0.18 <= w["x0"] < W*0.27
-                         and w["top"] > H*0.22
-                         and w["top"] < y_ultimo_metro + 15
-                         and _re.match(r"^\d{1,2}$", w["text"])
-                         and 0 <= int(w["text"]) <= 60]
-
-    metros_sorted = sorted(metro_y.keys())
-
-    def _y_metro_v2(y_pt):
-        for idx, n in enumerate(metros_sorted):
+    def _y_metro(y_pt):
+        for i, n in enumerate(metros_lista):
             if n == 0: continue
-            n_prev = metros_sorted[idx-1]
+            n_prev = metros_lista[i-1]
             y_base = metro_y[n]
-            y_topo = metro_y[n_prev]
-            if y_topo - 12 <= y_pt <= y_base + 12:
+            y_topo = metro_y.get(n_prev, y_base - altura_metro)
+            if y_topo - altura_metro*0.45 <= y_pt <= y_base + altura_metro*0.45:
                 return n
         return None
 
-    # Mapear golpes individuais por metro
     golpes_por_metro = {}
-    for w in golpes_words_ind:
-        n = _y_metro_v2((w["top"] + w["bottom"]) / 2)
+    for w in golpes_ind:
+        yc = (w["top"] + w["bottom"]) / 2
+        n = _y_metro(yc)
         if n is not None:
             golpes_por_metro.setdefault(n, []).append(int(w["text"]))
 
-    # Mapear somas por metro (para fallback)
-    somas_por_metro = {}
-    for w in golpes_words_soma:
-        n = _y_metro_v2((w["top"] + w["bottom"]) / 2)
-        if n is not None:
-            somas_por_metro.setdefault(n, []).append(int(w["text"]))
+    # Descrições (coluna direita, x > 55% da largura)
+    desc_words = [w for w in words
+                  if w["x0"] > W*0.55
+                  and w["top"] > H*0.22 and w["top"] < y_limite + altura_metro
+                  and len(w["text"]) > 1
+                  and not re.match(r"^[\d,./:><=]+$", w["text"])]
 
-    # Classificação (x > 65%)
-    classif_words = [w for w in words
-                     if w["x0"] > W*0.65
-                     and w["top"] > H*0.22
-                     and w["bottom"] < H*0.90
-                     and not _re.match(r"^\d{3,},\d{2}$", w["text"])
-                     and not _re.match(r"^\d+/\d+$", w["text"])
-                     ]
-    _EXCLUIR_SET = {"CREA", "Ghisi", "Civil", "Engenheiro", "Responsável",
-                    "LIMITE", "SONDAGEM", "Obs.:"}
-    classif_words = [w for w in classif_words if w["text"] not in _EXCLUIR_SET]
+    origens_dir = {}
+    orig_words = [w for w in words
+                  if w["text"].upper() in _ORIGENS_LOCAL
+                  and w["x0"] > W*0.88 and w["top"] > H*0.22]
+    for w in orig_words:
+        yr = round((w["top"] + w["bottom"]) / 2)
+        if yr not in origens_dir:
+            origens_dir[yr] = w["text"].upper()
 
-    # Origens à direita (x > 85%)
-    origens_direita = {}
-    for w in classif_words:
-        if w["x0"] > W*0.85 and w["text"].upper() in _ORIGENS_LOCAL:
-            origens_direita[round(w["top"])] = w["text"].upper()
-
-    # Agrupar em linhas
-    linhas_classif = []
-    if classif_words:
-        cs = sorted(classif_words, key=lambda w: w["top"])
-        la = [cs[0]]
-        for w in cs[1:]:
-            if abs(w["top"] - la[-1]["top"]) < 4:
-                la.append(w)
+    # Agrupar linhas de descrição em blocos
+    desc_lines = []
+    if desc_words:
+        dw_s = sorted(desc_words, key=lambda w: w["top"])
+        grp = [dw_s[0]]
+        for w in dw_s[1:]:
+            if abs(w["top"] - grp[-1]["top"]) < 5:
+                grp.append(w)
             else:
-                linhas_classif.append(la)
-                la = [w]
-        linhas_classif.append(la)
+                desc_lines.append(grp)
+                grp = [w]
+        desc_lines.append(grp)
 
-    def _linha_texto(wds):
-        return " ".join(
-            w["text"] for w in sorted(wds, key=lambda w: w["x0"])
-            if w["text"].upper() not in _ORIGENS_LOCAL
-        )
-
-    def _origem_da_linha(wds):
-        for w in wds:
-            if w["text"].upper() in _ORIGENS_LOCAL:
-                return w["text"].upper()
-        return ""
-
-    def _limpar_desc_final(txt):
-        txt = _re.sub(r"\d{1,2}[,\.]\d{1,2}", "", txt)
-        txt = _re.sub(r"~\d+m,?", "", txt)
-        txt = _re.sub(r"\s{2,}", " ", txt)
-        return txt.strip("., ").upper()
-
-    # Agrupar linhas em blocos
-    blocos_classif = []
-    if linhas_classif:
-        bl = [linhas_classif[0]]
-        for ln in linhas_classif[1:]:
-            y_anterior = bl[-1][0]["top"]
-            y_atual    = ln[0]["top"]
-            if y_atual - y_anterior < altura_metro * 1.5:
+    blocos_desc = []
+    if desc_lines:
+        bl = [desc_lines[0]]
+        for ln in desc_lines[1:]:
+            if ln[0]["top"] - bl[-1][0]["top"] < altura_metro * 1.5:
                 bl.append(ln)
             else:
                 y0 = bl[0][0]["top"]; y1 = bl[-1][0]["bottom"]
-                txts = []; orig = ""
-                for b in bl:
-                    o = _origem_da_linha(b)
-                    if o: orig = o
-                    t = _linha_texto(b)
-                    if t.strip(): txts.append(t)
-                for y_orig, o_dir in origens_direita.items():
-                    if y0 - 5 <= y_orig <= y1 + 20:
-                        orig = o_dir; break
-                desc = _limpar_desc_final(" ".join(txts))
-                if desc:
-                    blocos_classif.append((y0, y1, desc, orig))
+                texto_b = " ".join(
+                    " ".join(w["text"] for w in sorted(g, key=lambda w: w["x0"])
+                             if w["text"].upper() not in _ORIGENS_LOCAL)
+                    for g in bl
+                )
+                desc_limpa = _limpar_desc(texto_b)
+                orig_b = ""
+                for yr, oo in origens_dir.items():
+                    if y0 - 5 <= yr <= y1 + 20:
+                        orig_b = oo; break
+                if desc_limpa and _tem_solo(desc_limpa):
+                    blocos_desc.append((y0, y1, desc_limpa, orig_b))
                 bl = [ln]
         if bl:
             y0 = bl[0][0]["top"]; y1 = bl[-1][0]["bottom"]
-            txts = []; orig = ""
-            for b in bl:
-                o = _origem_da_linha(b)
-                if o: orig = o
-                t = _linha_texto(b)
-                if t.strip(): txts.append(t)
-            for y_orig, o_dir in origens_direita.items():
-                if y0 - 5 <= y_orig <= y1 + 20:
-                    orig = o_dir; break
-            desc = _limpar_desc_final(" ".join(txts))
-            if desc:
-                blocos_classif.append((y0, y1, desc, orig))
+            texto_b = " ".join(
+                " ".join(w["text"] for w in sorted(g, key=lambda w: w["x0"])
+                         if w["text"].upper() not in _ORIGENS_LOCAL)
+                for g in bl
+            )
+            desc_limpa = _limpar_desc(texto_b)
+            orig_b = ""
+            for yr, oo in origens_dir.items():
+                if y0 - 5 <= yr <= y1 + 20:
+                    orig_b = oo; break
+            if desc_limpa and _tem_solo(desc_limpa):
+                blocos_desc.append((y0, y1, desc_limpa, orig_b))
 
-    # Filtrar blocos válidos
-    y_max_metros = max(metro_y.values()) + altura_metro if metro_y else 9999
-    blocos_validos = [(yi, yf, txt, orig) for yi, yf, txt, orig in blocos_classif
-                      if yi <= y_max_metros + altura_metro * 0.5
-                      and not any(k in txt.upper() for k in
-                                  ["LIMITE DE", "OBS", "NBR-6484", "IMPENETRÁVEL",
-                                   "TRÉPANO", "CIRCULAÇÃO", "LAVAGEM", "PERFURAÇÃO"])]
-
-    # Associar blocos → metros
-    desc_por_metro = {}; orig_por_metro = {}
     y_max = max(metro_y.values())
-
-    for j, (y_ini, y_fim, texto, orig) in enumerate(blocos_validos):
-        y_prox = blocos_validos[j+1][0] if j+1 < len(blocos_validos) else y_max + altura_metro
+    desc_por_metro = {}; orig_por_metro = {}
+    for j, (y_ini, y_fim, texto, orig) in enumerate(blocos_desc):
+        y_prox = blocos_desc[j+1][0] if j+1 < len(blocos_desc) else y_max + altura_metro
         for n in metros_lista:
             if n == 0: continue
             n_prev = metros_lista[metros_lista.index(n)-1]
@@ -547,77 +660,46 @@ def _parse_geoloc_bbox(pagina) -> list:
                 desc_por_metro[n] = texto
                 orig_por_metro[n] = orig
 
-    # Preencher vazios
-    ultima_desc = ""; ultima_orig = ""
+    ult_d = ""; ult_o = ""
     for n in metros_lista:
         if n == 0: continue
         if n in desc_por_metro:
-            ultima_desc = desc_por_metro[n]
-            ultima_orig = orig_por_metro.get(n, "")
+            ult_d = desc_por_metro[n]; ult_o = orig_por_metro.get(n, "")
         else:
-            desc_por_metro[n] = ultima_desc.upper() if ultima_desc else ""
-            orig_por_metro[n] = ultima_orig
+            desc_por_metro[n] = ult_d; orig_por_metro[n] = ult_o
 
-    # Montar MetroSPT
     metros_spt = []
     for n in metros_lista:
         if n == 0: continue
         gs = sorted(golpes_por_metro.get(n, []))
-        gs_validos = [g for g in gs if g != 15]
-        if len(gs_validos) >= 3:
-            g1,g2,g3 = gs_validos[0],gs_validos[1],gs_validos[2]
-        elif len(gs_validos) == 2:
-            g1,g2,g3 = 0,gs_validos[0],gs_validos[1]
-        elif len(gs) >= 3:
-            g1,g2,g3 = gs[0],gs[1],gs[2]
-        else:
-            # Fallback: usar colunas 1ª+2ª e 2ª+3ª quando individuais ausentes
-            ss = sorted(somas_por_metro.get(n, []))
-            if len(ss) >= 2:
-                # ss[0] = 1ª+2ª, ss[1] = 2ª+3ª → nspt = ss[1]
-                g1, g2, g3 = 0, 0, ss[1]
-            elif len(ss) == 1:
-                g1, g2, g3 = 0, 0, ss[0]
-            else:
-                continue
+        gv = [g for g in gs if g != 15]
+        if len(gv) >= 3:   g1,g2,g3 = gv[0],gv[1],gv[2]
+        elif len(gv) == 2: g1,g2,g3 = 0,gv[0],gv[1]
+        elif len(gs) >= 3: g1,g2,g3 = gs[0],gs[1],gs[2]
+        else: continue
         metros_spt.append(MetroSPT(
             prof_m=float(n), nspt=g2+g3,
             golpes_1=g1, golpes_2=g2, golpes_3=g3,
-            descricao=desc_por_metro.get(n, ""),
-            origem=orig_por_metro.get(n, ""),
+            descricao=desc_por_metro.get(n,""),
+            origem=orig_por_metro.get(n,""),
         ))
     return metros_spt
 
 
-# ---------------------------------------------------------------------------
-# Parser bbox universal (Souli, SM, layouts com descrição variada)
-# ---------------------------------------------------------------------------
-
 def _parse_bbox_esquerda(pagina) -> list:
-    import re as _re
+    """Parser automático para layouts Souli/Suporte SM (golpes à esquerda)."""
     from collections import Counter as _Counter
     _ORIGENS_SET = {"SS","SRM","SRJ","SR","AT","AL","DFL","SAR","RC","SP","SDL","SRS"}
-    _KW = ["argila","areia","silte","solo","pedregulho","rocha","aterro",
-           "vegetal","orgânico","turfoso"]
-    _KW_UP = [k.upper() for k in _KW]
-    _IGNORAR = {
-        "LIMITE","SONDAGEM","NBR","ENGENHEIRO","CREA","OBS","RESPONSÁVEL",
-        "PÁGINA","DATA","CLIENTE","OBRA","LOCAL","ENSAIO","AVANÇO",
-        "PENETRAÇÃO","RESISTÊNCIA","GOLPES","REVESTIMENTO","SISTEMA",
-        "PERFURAÇÃO","SONDADOR","COORDENADAS","NORTE","ESTE","DATUM",
-        "CLASSIFICAÇÃO","MATERIAL","LIFREP","MEGIRO","PROFUNDIDADE",
-        "COTA","PERF","REV","PESO","AMOSTRADOR","EXT","INT","ESCALA",
-        "ALTURA","QUEDA","MANUAL","SIRGAS","FUSO","TRADO","CIRCULAÇÃO",
-    }
+    _KW_UP = [k.upper() for k in _KW_SOLO]
 
     W = pagina.width; H = pagina.height
     words = pagina.extract_words(use_text_flow=False, keep_blank_chars=False)
 
-    # Escala
     esc_cands = [w for w in words
-                 if _re.match(r"^\d{1,2}$", w["text"])
+                 if re.match(r"^\d{1,2}$", w["text"])
                  and int(w["text"]) <= 30 and w["top"] > H*0.20]
-    if len(esc_cands) < 3: return []
+    if len(esc_cands) < 3:
+        return []
 
     x_freq = _Counter(round(w["x0"]/10)*10 for w in esc_cands)
     x_esc = x_freq.most_common(1)[0][0]
@@ -628,7 +710,8 @@ def _parse_bbox_esquerda(pagina) -> list:
             n = int(w["text"]); y = (w["top"]+w["bottom"])/2
             if n not in metro_y: metro_y[n] = y
 
-    lim_w = [w for w in words if any(k in w["text"].upper() for k in ["LIMITE","IMPENET"])
+    lim_w = [w for w in words
+             if any(k in w["text"].upper() for k in ["LIMITE","IMPENET"])
              and w["top"] > H*0.30]
     y_lim = min((w["top"] for w in lim_w), default=H*0.85)
     metro_y = {n:y for n,y in metro_y.items() if y<=y_lim+40}
@@ -638,39 +721,33 @@ def _parse_bbox_esquerda(pagina) -> list:
     alts = [abs(metro_y[ml[i]]-metro_y[ml[i-1]]) for i in range(1,len(ml))]
     h_metro = sum(alts)/len(alts) if alts else 28.0
 
-    # Dados
-    dados_words = [w for w in words
-                   if w["top"] > H*0.22 and w["top"] < y_lim+h_metro
-                   and len(w["text"]) > 1
-                   and not _re.match(r"^[\d,./:><]+$", w["text"])
-                   and not _re.match(r"^\d+/\d+$", w["text"])
-                   and w["text"].upper() not in _IGNORAR
-                   and abs(w["x0"]-x_esc) > 15]
-
-    solo_words = [w for w in dados_words if any(k in w["text"].upper() for k in _KW_UP)]
+    solo_words = [w for w in words if any(k in w["text"].upper() for k in _KW_UP)]
     if not solo_words: return []
 
-    x_desc_min = min(w["x0"] for w in solo_words)-5
-    x_desc_max = max(w["x0"]+w.get("width",50) for w in solo_words)+10
+    x_desc_min = min(w["x0"] for w in solo_words) - 5
+    x_desc_max = max(w["x0"] + w.get("width", 50) for w in solo_words) + 10
 
-    desc_words = [w for w in dados_words
+    desc_words = [w for w in words
                   if x_desc_min-10 <= w["x0"] <= x_desc_max
+                  and w["top"] <= y_lim + h_metro
                   and (any(k in w["text"].upper() for k in _KW_UP)
-                       or (w["text"][0].isupper() and len(w["text"])>2)
-                       or (w["text"].isupper() and len(w["text"])>2))]
+                       or (w["text"][0].isupper() and len(w["text"])>2))]
 
-    # Golpes: inteiros 0-60 fora da desc e fora da escala
     golpe_words = [w for w in words
-                   if _re.match(r"^\d{1,2}$", w["text"])
+                   if re.match(r"^\d{1,2}$", w["text"])
                    and 0 <= int(w["text"]) <= 60
                    and w["top"] > H*0.22 and w["top"] < y_lim+15
                    and not (x_desc_min-15 <= w["x0"] <= x_desc_max+15)
                    and not (x_esc-20 <= w["x0"] <= x_esc+20)]
 
+    orig_words = [w for w in words
+                  if w["text"].upper() in _ORIGENS_SET
+                  and w["top"]>H*0.20 and w["top"]<y_lim+h_metro]
+
     def _y_metro(y_pt):
-        for i,n in enumerate(ml):
+        for i, n in enumerate(ml):
             if n==0: continue
-            np=ml[i-1]
+            np = ml[i-1]
             if metro_y[np]-12 <= y_pt <= metro_y[n]+12: return n
         return None
 
@@ -679,15 +756,11 @@ def _parse_bbox_esquerda(pagina) -> list:
         n = _y_metro((w["top"]+w["bottom"])/2)
         if n is not None: gpm.setdefault(n,[]).append(int(w["text"]))
 
-    # Origens (qualquer X)
-    orig_words = [w for w in words if w["text"].upper() in _ORIGENS_SET
-                  and w["top"]>H*0.20 and w["top"]<y_lim+h_metro]
     orig_by_y = {}
     for w in orig_words:
         yr = round(w["top"])
         if yr not in orig_by_y: orig_by_y[yr] = w["text"].upper()
 
-    # Linhas e blocos de descrição
     linhas = []
     if desc_words:
         ds = sorted(desc_words, key=lambda w: w["top"])
@@ -702,7 +775,6 @@ def _parse_bbox_esquerda(pagina) -> list:
         def _lt(wds):
             return " ".join(w["text"] for w in sorted(wds,key=lambda w:w["x0"])
                             if w["text"].upper() not in _ORIGENS_SET)
-
         bl = [linhas[0]]
         for ln in linhas[1:]:
             if ln[0]["top"]-bl[-1][0]["top"] < h_metro*1.5:
@@ -720,10 +792,9 @@ def _parse_bbox_esquerda(pagina) -> list:
                     txts.append(t)
                 for yo,oo in orig_by_y.items():
                     if y0-h_metro*0.5 <= yo <= y1+h_metro*0.5: orig=oo; break
-                desc = _re.sub(r"\b0\d\b","", " ".join(txts))
-                desc = _re.sub(r"^[A-ZÀ-Ú]{1,2}\s+","",desc).strip().upper()
-                desc = _re.sub(r"\s{2,}"," ",desc).strip("., ")
-                if desc and len(desc)>3 and any(k in desc for k in _KW_UP):
+                desc = re.sub(r"\b0\d\b","", " ".join(txts))
+                desc = re.sub(r"\s{2,}"," ",desc).strip("., ").upper()
+                if desc and len(desc)>3 and _tem_solo(desc):
                     blocos.append((y0,y1,desc,orig))
                 bl=[ln]
         if bl:
@@ -739,13 +810,11 @@ def _parse_bbox_esquerda(pagina) -> list:
                 txts.append(t)
             for yo,oo in orig_by_y.items():
                 if y0-h_metro*0.5 <= yo <= y1+h_metro*0.5: orig=oo; break
-            desc = _re.sub(r"\b0\d\b","", " ".join(txts))
-            desc = _re.sub(r"^[A-ZÀ-Ú]{1,2}\s+","",desc).strip().upper()
-            desc = _re.sub(r"\s{2,}"," ",desc).strip("., ")
-            if desc and len(desc)>3 and any(k in desc for k in _KW_UP):
+            desc = re.sub(r"\b0\d\b","", " ".join(txts))
+            desc = re.sub(r"\s{2,}"," ",desc).strip("., ").upper()
+            if desc and len(desc)>3 and _tem_solo(desc):
                 blocos.append((y0,y1,desc,orig))
 
-    # Associar
     dpm={}; opm={}
     y_max=max(metro_y.values())
     for j,(y_ini,y_fim,texto,orig) in enumerate(blocos):
@@ -782,7 +851,7 @@ def _parse_bbox_esquerda(pagina) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Interface pública
+# Interface pública — modo automático
 # ---------------------------------------------------------------------------
 
 def ler_pdf_sondagem(caminho_ou_bytes) -> list:
@@ -799,14 +868,14 @@ def ler_pdf_sondagem(caminho_ou_bytes) -> list:
             texto = pagina.extract_text() or ""
 
             eh_perfil = any(kw in texto for kw in [
-                "Classificação do Material", "Resistência à Penetração",
-                "PERFIL INDIVIDUAL", "Sondagem a Percussão",
-                "Sondagem de Reconhecimento", "N-SPT", "NSPT",
+                "Classificação do Material","Resistência à Penetração",
+                "PERFIL INDIVIDUAL","Sondagem a Percussão",
+                "Sondagem de Reconhecimento","N-SPT","NSPT",
                 "Sondagem executada conforme",
             ])
             eh_memorial = any(kw in texto for kw in [
-                "Memorial Fotográfico", "Registro Fotográfico",
-                "Localização de Sondagem", "Quadro de Fotos",
+                "Memorial Fotográfico","Registro Fotográfico",
+                "Localização de Sondagem","Quadro de Fotos",
             ])
             if not eh_perfil or eh_memorial:
                 continue
@@ -815,44 +884,37 @@ def ler_pdf_sondagem(caminho_ou_bytes) -> list:
             cota_boca   = _extrair_cota(texto) or 0.0
             nivel_dagua = _extrair_nivel(texto)
 
-            # Grupos de empresa → parser adequado
             _GRUPO_A = [
-                "GEOLOC ENGENHARIA E GEOLOGIA",
-                "NEW SOLOS ENGENHARIA",
+                "GEOLOC ENGENHARIA E GEOLOGIA","NEW SOLOS ENGENHARIA",
                 "Sondagem de Reconhecimento com SPT",
             ]
             _GRUPO_B = [
-                "SUPORTE SONDAGENS", "Suporte Sondagens",
-                "souligeotecnia", "SOULI", "Souli",
+                "SUPORTE SONDAGENS","Suporte Sondagens","souligeotecnia","SOULI","Souli",
                 "PERFIL INDIVIDUAL DE SONDAGEM MISTA À PERCUSSÃO",
                 "PERFIL INDIVIDUAL DE SONDAGEM MISTA (SM)",
             ]
 
             if any(kw in texto for kw in _GRUPO_A):
                 metros = _parse_geoloc_bbox(pagina)
-                blocos = []
                 if len(metros) < 3:
                     metros_txt, blocos = _parse_pagina(texto)
                     metros_txt = _associar(metros_txt, blocos)
                     if len(metros_txt) > len(metros):
-                        metros = metros_txt; blocos = []
+                        metros = metros_txt
             elif any(kw in texto for kw in _GRUPO_B):
                 metros = _parse_bbox_esquerda(pagina)
-                blocos = []
                 if len(metros) < 3:
                     metros_txt, blocos = _parse_pagina(texto)
                     metros_txt = _associar(metros_txt, blocos)
                     if len(metros_txt) > len(metros):
-                        metros = metros_txt; blocos = []
+                        metros = metros_txt
             else:
                 metros_dir = _parse_geoloc_bbox(pagina)
                 metros_esq = _parse_bbox_esquerda(pagina)
                 metros_txt, blocos = _parse_pagina(texto)
                 metros_txt = _associar(metros_txt, blocos)
                 metros = max([metros_dir, metros_esq, metros_txt], key=len)
-                blocos = []
 
-            # Deduplicar e ordenar
             vistos: set = set()
             unicos = []
             for m in sorted(metros, key=lambda x: x.prof_m):
@@ -869,6 +931,10 @@ def ler_pdf_sondagem(caminho_ou_bytes) -> list:
                 ))
     return sondagens
 
+
+# ---------------------------------------------------------------------------
+# Utilitários de horizontes
+# ---------------------------------------------------------------------------
 
 def agrupar_horizontes(metros, cota_boca=0.0, offset_cota=0.0):
     if not metros: return []
