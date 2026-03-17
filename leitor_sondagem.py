@@ -683,6 +683,65 @@ def _parse_geoloc_bbox(pagina) -> list:
             descricao=desc_por_metro.get(n,""),
             origem=orig_por_metro.get(n,""),
         ))
+
+    # ── Capturar profundidades decimais do texto da coluna direita ──────────
+    # Ex: "10,13 Pedregulhos de gnaisse." ou "10,23 LIMITE DE SONDAGEM"
+    # Essas profundidades aparecem no texto mas não na escala vertical.
+    _RE_PROF_DEC = re.compile(r'\b(\d{1,2}[,.][\d]{2})\b')
+    prof_inteiros = {m.prof_m for m in metros_spt}
+    prof_max_inteiro = max(prof_inteiros) if prof_inteiros else 0.0
+
+    # Palavras da coluna direita com profundidades decimais > último metro inteiro
+    dec_candidates = [w for w in words
+                      if w["x0"] > W*0.40
+                      and w["top"] >= y_ultimo - altura_metro*0.5
+                      and w["top"] <= y_limite + altura_metro*2
+                      and _RE_PROF_DEC.match(w["text"])]
+
+    # Também varrer o texto extraído próximo ao limite
+    texto_limite = pagina.crop((W*0.40, y_ultimo - altura_metro, W, y_limite + altura_metro*2)).extract_text() or ""
+    for m in _RE_PROF_DEC.finditer(texto_limite):
+        val = _num(m.group(1))
+        if val and val > prof_max_inteiro and val not in prof_inteiros:
+            # Herdar golpes e descrição do último metro inteiro
+            ultimo = metros_spt[-1] if metros_spt else None
+            desc_dec = ""
+            # Tentar capturar texto após a profundidade decimal
+            pos = m.end()
+            trecho = texto_limite[pos:pos+120].strip()
+            if _tem_solo(trecho):
+                desc_dec = _limpar_desc(trecho.split('\n')[0])
+            elif ultimo:
+                desc_dec = ultimo.descricao
+            orig_dec = ultimo.origem if ultimo else ""
+            metros_spt.append(MetroSPT(
+                prof_m=round(val, 2),
+                nspt=ultimo.nspt if ultimo else 0,
+                golpes_1=ultimo.golpes_1 if ultimo else 0,
+                golpes_2=ultimo.golpes_2 if ultimo else 0,
+                golpes_3=ultimo.golpes_3 if ultimo else 0,
+                descricao=desc_dec,
+                origem=orig_dec,
+            ))
+            prof_inteiros.add(val)
+
+    # Também capturar de palavras individuais (ex: "10,13" como token isolado)
+    for w in dec_candidates:
+        val = _num(_RE_PROF_DEC.match(w["text"]).group(1))
+        if val and val > prof_max_inteiro and val not in prof_inteiros:
+            ultimo = metros_spt[-1] if metros_spt else None
+            metros_spt.append(MetroSPT(
+                prof_m=round(val, 2),
+                nspt=ultimo.nspt if ultimo else 0,
+                golpes_1=ultimo.golpes_1 if ultimo else 0,
+                golpes_2=ultimo.golpes_2 if ultimo else 0,
+                golpes_3=ultimo.golpes_3 if ultimo else 0,
+                descricao=ultimo.descricao if ultimo else "",
+                origem=ultimo.origem if ultimo else "",
+            ))
+            prof_inteiros.add(val)
+
+    metros_spt.sort(key=lambda m: m.prof_m)
     return metros_spt
 
 
@@ -847,6 +906,32 @@ def _parse_bbox_esquerda(pagina) -> list:
             golpes_1=g1,golpes_2=g2,golpes_3=g3,
             descricao=dpm.get(n,""),origem=opm.get(n,""),
         ))
+
+    # Capturar profundidades decimais proximas ao limite da sondagem
+    import re as _re2
+    _RE_PROF_DEC2 = _re2.compile(r'\b(\d{1,2}[,.]\d{2})\b')
+    prof_set  = {m.prof_m for m in metros_spt}
+    prof_max2 = max(prof_set) if prof_set else 0.0
+    y_ult2    = max(metro_y.values()) if metro_y else H*0.85
+    txt_lim2  = pagina.crop((0, y_ult2 - h_metro, W, y_lim + h_metro*2)).extract_text() or ""
+    for mat in _RE_PROF_DEC2.finditer(txt_lim2):
+        val = _num(mat.group(1))
+        if val and val > prof_max2 and val not in prof_set:
+            ult = metros_spt[-1] if metros_spt else None
+            trecho = txt_lim2[mat.end():mat.end()+120].strip()
+            desc_d = _limpar_desc(trecho.split(chr(10))[0]) if _tem_solo(trecho) else (ult.descricao if ult else "")
+            metros_spt.append(MetroSPT(
+                prof_m=round(val,2),
+                nspt=ult.nspt if ult else 0,
+                golpes_1=ult.golpes_1 if ult else 0,
+                golpes_2=ult.golpes_2 if ult else 0,
+                golpes_3=ult.golpes_3 if ult else 0,
+                descricao=desc_d,
+                origem=ult.origem if ult else "",
+            ))
+            prof_set.add(val)
+
+    metros_spt.sort(key=lambda m: m.prof_m)
     return metros_spt
 
 
